@@ -3,6 +3,7 @@
 
 import { getProvider } from "@/lib/commerce/provider";
 import { env } from "@/lib/env";
+import { MSG } from "@/lib/i18n";
 import { makeCallbackData, sendOwner } from "@/lib/notify/telegram";
 import { DEFAULT_LIMITS, evaluatePolicy, istDayStart, istWeekStart, type Limits, type PolicyLine, type PolicyReason } from "@/lib/orders/policy";
 import { getStore } from "@/lib/store";
@@ -73,7 +74,7 @@ export type ConfirmOutcome =
   | { status: "paused" }
   | { status: "blocked" }
   | { status: "resync"; cart: CartView }
-  | { status: "invalid"; error: string; hi?: string };
+  | { status: "invalid"; error: string; hi?: string; en?: string };
 
 /**
  * Called when the cook completes hold-to-confirm (+ undo countdown) on a cart_synced draft.
@@ -82,7 +83,7 @@ export type ConfirmOutcome =
 export async function confirmDraft(draft: Draft): Promise<ConfirmOutcome> {
   const store = getStore();
   if (draft.state !== "cart_synced") return { status: "invalid", error: `state ${draft.state}` };
-  if (!draft.cart || draft.cart.items.length === 0) return { status: "invalid", error: "empty cart", hi: "कुछ भी चुना नहीं है" };
+  if (!draft.cart || draft.cart.items.length === 0) return { status: "invalid", error: "empty cart", ...MSG.nothing_chosen };
 
   const flags = await getFlags();
   if (flags.paused) return { status: "paused" };
@@ -110,8 +111,8 @@ export async function confirmDraft(draft: Draft): Promise<ConfirmOutcome> {
   }
 
   const itemTotal = cart.itemTotalPaise ?? cart.items.reduce((s, i) => s + i.linePaise, 0);
-  if (itemTotal < MIN_ORDER_PAISE) return { status: "invalid", error: "below_min_order", hi: "₹99 से कम — और सामान जोड़ें" };
-  if (cart.toPayPaise <= 0) return { status: "invalid", error: "zero_total", hi: "दाम नहीं मिला — फिर कोशिश करें" };
+  if (itemTotal < MIN_ORDER_PAISE) return { status: "invalid", error: "below_min_order", ...MSG.below_min };
+  if (cart.toPayPaise <= 0) return { status: "invalid", error: "zero_total", ...MSG.zero_total };
 
   const method: PaymentMethod = draft.paymentMethod ?? "SWIGGY_MONEY";
   const now = new Date();
@@ -172,7 +173,7 @@ export async function notifyApprovalRequest(draft: Draft, reasons: PolicyReason[
   const method = draft.paymentMethod === "COD" ? "Cash on delivery" : "Swiggy Money";
   const why = reasons.map((x) => `- ${x.en}`).join("\n");
   await sendOwner(
-    `Approval needed — ₹${rupeesText(cart.toPayPaise)} (${method})\n\n${cartItemsText(cart)}\n\nHeard: "${draft.transcript ?? ""}"\n\nWhy:\n${why}\n\nButtons expire in 60 min.`,
+    `Approval needed — ₹${rupeesText(cart.toPayPaise)} (${method})\n\n${cartItemsText(cart)}\n\nHeard: "${draft.transcript ?? ""}"\n\nWhy:\n${why}\n\nButtons expire in 60 min. Keep the Swiggy app CLOSED until this order completes (Swiggy warns of session conflicts).`,
     [[{ text: `✅ Approve ₹${rupeesText(cart.toPayPaise)}`, callback_data: approve }, { text: "❌ Reject", callback_data: reject }]],
   );
 }
@@ -196,7 +197,7 @@ export async function approveDraft(draftId: string, version?: number): Promise<"
 }
 
 export async function rejectDraft(draftId: string): Promise<boolean> {
-  const ok = await getStore().casDraft(draftId, ["awaiting_approval"], { state: "rejected", error: "मालिक ने मना किया" });
+  const ok = await getStore().casDraft(draftId, ["awaiting_approval"], { state: "rejected", error: "err_rejected" });
   if (ok) await getStore().audit("rejected", { draftId });
   return Boolean(ok);
 }
@@ -265,7 +266,7 @@ export async function reconcileUnknownOrders(): Promise<void> {
   const store = getStore();
   const stale = await store.markStalePlacingUnknown(new Date(Date.now() - STALE_PLACING_MS));
   for (const s of stale) {
-    await store.casDraft(s.draftId, ["placing_swiggypay", "placing_cod"], { state: "unknown", error: "ऑर्डर शायद हो गया — दोबारा मत करना" });
+    await store.casDraft(s.draftId, ["placing_swiggypay", "placing_cod"], { state: "unknown", error: "err_unknown" });
     await store.audit("stale_placing_marked_unknown", { draftId: s.draftId });
     await sendOwner(`⚠️ An order attempt (₹${rupeesText(s.totalPaise)}) never finished — marked UNKNOWN. New orders are blocked until /resolve.`);
   }

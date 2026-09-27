@@ -19,7 +19,7 @@ import { env } from "@/lib/env";
 import { sendOwner } from "@/lib/notify/telegram";
 import { getFlags, getLimits, markOrderedNames, notifyApprovalRequest, reconcileUnknownOrders, spendContext, spendGuard } from "@/lib/orders/engine";
 import { getStore } from "@/lib/store";
-import { rupeesText, type CartLine, type Draft, type DraftState, type PaymentMethod } from "@/lib/types";
+import { rupeesText, type CartLine, type Draft, type DraftState, type PaymentMethod, type PaymentOptions } from "@/lib/types";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const CHECKOUT_LEASE_MS = 5 * 60_000;
@@ -72,12 +72,12 @@ export async function runCheckout(draftId: string): Promise<void> {
   const flags = await getFlags();
   if (flags.paused) {
     // stays 'approved'; retryApprovedDrafts runs it after /resume (or it expires after 2 h)
-    await store.updateDraftFields(draftId, { error: "अभी रुका हुआ है — मालिक से पूछें" }, ["approved"]);
+    await store.updateDraftFields(draftId, { error: "err_paused_wait" }, ["approved"]);
     await sendOwner("An approved order is waiting but ordering is PAUSED. /resume places it.");
     return;
   }
   if (await store.anyBlockingOrder()) {
-    await store.updateDraftFields(draftId, { error: "पिछला ऑर्डर पक्का नहीं हुआ — रुकिए" }, ["approved"]);
+    await store.updateDraftFields(draftId, { error: "err_blocked_wait" }, ["approved"]);
     await sendOwner("An approved order is waiting behind an UNKNOWN order. /resolve first; it then places automatically.");
     return;
   }
@@ -103,7 +103,7 @@ export async function runCheckout(draftId: string): Promise<void> {
 
   // Exclusive lease: takes over this draft's cart lease; cart edits are refused from here on.
   if (!(await store.acquireLock(draftId, CHECKOUT_LEASE_MS, "checkout"))) {
-    await voidAttempt(a, "retry", "कोई और ऑर्डर चल रहा है — थोड़ी देर में अपने आप हो जाएगा", "commerce lock busy — will retry");
+    await voidAttempt(a, "retry", "err_lock_retry", "commerce lock busy — will retry");
     return;
   }
 
@@ -111,7 +111,7 @@ export async function runCheckout(draftId: string): Promise<void> {
     // Spend windows may have moved since approval (a parallel order) — never exceed silently.
     const overWindow = await spendGuard(draft, approvedPaise, method === "COD");
     if (overWindow.length) {
-      await voidAttempt(a, "reask", "आज की सीमा पूरी — मालिक से फिर पूछ रहे हैं", `spend window exceeded: ${overWindow.map((r) => r.code).join(",")}`);
+      await voidAttempt(a, "reask", "err_limit_reask", `spend window exceeded: ${overWindow.map((r) => r.code).join(",")}`);
       const fresh = await store.getDraft(draftId);
       if (fresh) await notifyApprovalRequest(fresh, overWindow);
       return;
@@ -133,7 +133,7 @@ export async function runCheckout(draftId: string): Promise<void> {
 
     // ── Real order pre-flight ─────────────────────────────────────────────────
     if (!env.pinnedAddressId) {
-      await voidAttempt(a, "terminal", "सेटअप पूरा नहीं है — मालिक को बताएं", "PINNED_ADDRESS_ID not set", "CONFIG");
+      await voidAttempt(a, "terminal", "err_setup", "PINNED_ADDRESS_ID not set", "CONFIG");
       await sendOwner("❌ Cannot place orders: PINNED_ADDRESS_ID is not set.");
       return;
     }
@@ -147,23 +147,23 @@ export async function runCheckout(draftId: string): Promise<void> {
       const want = new Map(snapshotLines(draft).map((l) => [l.spinId, l.quantity]));
       const exactMatch = live.items.length === want.size && live.items.every((i) => want.get(i.spinId) === i.quantity);
       if (!exactMatch) {
-        await voidAttempt(a, "terminal", "सामान बदल गया — दोबारा लिस्ट बनाएं", "live cart does not exactly match the approved snapshot");
+        await voidAttempt(a, "terminal", "err_items_changed", "live cart does not exactly match the approved snapshot");
         await sendOwner("❌ Order NOT placed: the live cart did not match the approved list (stock changed?). Cook was told to redo.");
         return;
       }
       if (live.toPayPaise <= 0) {
         // fail CLOSED: an unparsed bill would otherwise pass the ceiling check vacuously
-        await voidAttempt(a, "terminal", "दाम नहीं मिला — मालिक को बताएं", "live cart total unreadable (0)", "CONFIG");
+        await voidAttempt(a, "terminal", "err_price_unread", "live cart total unreadable (0)", "CONFIG");
         await sendOwner("❌ Order NOT placed: could not read the cart total from Swiggy (payload shape?). Check the adapter mapping.");
         return;
       }
       if (live.toPayPaise > approvedPaise) {
-        await voidAttempt(a, "terminal", "दाम बदल गया — दोबारा पूछें", `live total ₹${rupeesText(live.toPayPaise)} > approved ₹${rupeesText(approvedPaise)}`);
+        await voidAttempt(a, "terminal", "err_price_up", `live total ₹${rupeesText(live.toPayPaise)} > approved ₹${rupeesText(approvedPaise)}`);
         await sendOwner(`❌ Order NOT placed: total rose to ₹${rupeesText(live.toPayPaise)} (approved ₹${rupeesText(approvedPaise)}). Cook must confirm again.`);
         return;
       }
       if (live.selectedAddressId !== env.pinnedAddressId) {
-        await voidAttempt(a, "terminal", "पता ठीक नहीं है — मालिक को बताएं", `cart address ${live.selectedAddressId} != pinned`, "CONFIG");
+        await voidAttempt(a, "terminal", "err_address", `cart address ${live.selectedAddressId} != pinned`, "CONFIG");
         await sendOwner("🚨 Order NOT placed: the cart's delivery address is not the pinned home address.");
         return;
       }
@@ -177,18 +177,19 @@ export async function runCheckout(draftId: string): Promise<void> {
           (fp.lat === undefined || round2(fp.lat) === round2(addr.lat)) &&
           (fp.lng === undefined || round2(fp.lng) === round2(addr.lng));
         if (!fpOk) {
-          await voidAttempt(a, "terminal", "पता ठीक नहीं है — मालिक को बताएं", "pinned address fingerprint mismatch", "CONFIG");
+          await voidAttempt(a, "terminal", "err_address", "pinned address fingerprint mismatch", "CONFIG");
           await sendOwner("🚨 Order NOT placed: the pinned address no longer matches its fingerprint. Someone edited the address?");
           return;
         }
       }
-      const pay = await provider.getPaymentOptions();
-      const offered = method === "SWIGGY_MONEY" ? pay.swiggyMoney?.available : pay.cod?.available;
+      // COD is the documented default; if the payment-options tool is missing, COD is still offered
+      const pay: PaymentOptions = await provider.getPaymentOptions().catch(() => ({ cod: { available: true } }));
+      const offered = method === "SWIGGY_MONEY" ? pay.swiggyMoney?.available : (pay.cod?.available ?? true);
       if (!offered) {
         await voidAttempt(
           a,
           "terminal",
-          method === "SWIGGY_MONEY" ? "वॉलेट में पैसे नहीं हैं — मालिक को बताया" : "कैश ऑर्डर अभी नहीं हो सकता",
+          method === "SWIGGY_MONEY" ? "err_wallet" : "err_cod_na",
           `${method} not offered by get_payment_options`,
           "PAYMENT_DECLINED",
         );
@@ -201,17 +202,17 @@ export async function runCheckout(draftId: string): Promise<void> {
       }
       // the cart edits lease must still be ours right before the irreversible call
       if (!(await store.lockHeldBy(draftId, "checkout"))) {
-        await voidAttempt(a, "retry", "थोड़ी देर में अपने आप हो जाएगा", "checkout lease lost during pre-flight");
+        await voidAttempt(a, "retry", "err_retry_soon", "checkout lease lost during pre-flight");
         return;
       }
     } catch (e) {
       if (e instanceof CommerceError && e.code === "AUTH") {
         // token died between approval and placement — park, resumed automatically after /login
-        await voidAttempt(a, "park", "मालिक को भेज दिया ✓ — थोड़ा इंतज़ार", "Swiggy login expired during pre-flight", "AUTH");
+        await voidAttempt(a, "park", "err_login_wait", "Swiggy login expired during pre-flight", "AUTH");
         await sendOwner("🔑 Swiggy login expired — an approved order is waiting. Send /login; it resumes automatically after you paste the code.");
         return;
       }
-      await voidAttempt(a, "terminal", "दुकान से जवाब नहीं मिला — थोड़ी देर में फिर कोशिश करें", `pre-flight failed: ${String((e as Error).message)}`);
+      await voidAttempt(a, "terminal", "err_shop_retry", `pre-flight failed: ${String((e as Error).message)}`);
       await sendOwner(`❌ Order NOT placed (nothing sent): pre-flight failed — ${String((e as Error).message).slice(0, 200)}`);
       return;
     }
@@ -254,7 +255,7 @@ export async function runCheckout(draftId: string): Promise<void> {
       await store.updateOrder(order.id, { state: "not_placed", raw: { sentToProvider: true, message: outcome.message, code: outcome.code } });
       await store.casDraft(draftId, [placingState], {
         state: "not_placed",
-        error: outcome.code === "PAYMENT_DECLINED" ? "पैसे नहीं कट पाए — मालिक को बताया" : "ऑर्डर नहीं हो पाया — थोड़ी देर में फिर कोशिश करें",
+        error: outcome.code === "PAYMENT_DECLINED" ? "err_payment" : "err_not_placed",
         meta: { ...(draft.meta ?? {}), failCode: outcome.code ?? null, failEn: outcome.message },
       });
       await store.audit("checkout_failed_definite", { draftId, data: { code: outcome.code, message: outcome.message } });
@@ -267,7 +268,7 @@ export async function runCheckout(draftId: string): Promise<void> {
 
     // unknown — BLOCK new checkouts, reconcile, never re-call checkout
     await store.updateOrder(order.id, { state: "unknown", raw: { sentToProvider: true, message: outcome.message } });
-    await store.casDraft(draftId, [placingState], { state: "unknown", error: "ऑर्डर शायद हो गया — दोबारा मत करना" });
+    await store.casDraft(draftId, [placingState], { state: "unknown", error: "err_unknown" });
     await store.audit("checkout_unknown", { draftId, data: { message: outcome.message } });
     await sendOwner(`⚠️ Checkout result UNKNOWN (₹${rupeesText(approvedPaise)}): ${outcome.message}\nNew orders are blocked. Reconciling against order history…`);
     for (const wait of [3000, 10_000, 30_000, 120_000]) {

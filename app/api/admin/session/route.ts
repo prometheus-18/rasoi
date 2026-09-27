@@ -26,9 +26,9 @@ export async function GET(req: NextRequest) {
     );
   }
   if (env.adminSetupKey) {
-    return page(`<h1>Rasoi setup</h1><p>Enter the ADMIN_SETUP_KEY from your environment.</p><form method="post"><input name="key" type="password" autocomplete="off" placeholder="setup key"><button type="submit">Continue →</button></form>`);
+    return page(`<h1>Rasoi setup</h1><p>Enter the ADMIN_SETUP_KEY from your environment.</p><form method="post"><input name="key" type="password" autocomplete="off" placeholder="setup key"><input type="hidden" name="next" value="/admin"><button type="submit">Continue →</button></form>`);
   }
-  return page(`<h1>Rasoi</h1><p>Send <b>/admin</b> to the Telegram bot to get a login link.</p>`);
+  return page(`<h1>Rasoi</h1><p>Send <b>/admin</b> to the Telegram bot to get a login link.</p><p>Still setting up? Add <b>ADMIN_SETUP_KEY</b> (and <b>DATABASE_URL</b>) to the Vercel environment variables and redeploy, then reload this page.</p>`);
 }
 
 export async function POST(req: NextRequest) {
@@ -45,7 +45,9 @@ export async function POST(req: NextRequest) {
   if (typeof key === "string" && key) {
     const session = await exchangeSetupKey(key);
     if (!session) return page(`<h1>Wrong key</h1><p><a href="/api/admin/session">Try again</a></p>`);
-    const res = NextResponse.redirect(`${env.appUrl}/admin`, 303);
+    const nextRaw = form?.get("next");
+    const next = typeof nextRaw === "string" && /^\/[a-z0-9/_-]*$/i.test(nextRaw) ? nextRaw : "/admin";
+    const res = NextResponse.redirect(`${env.appUrl}${next}`, 303);
     setOwnerCookie(res, session);
     return res;
   }

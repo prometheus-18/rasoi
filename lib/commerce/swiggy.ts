@@ -201,6 +201,27 @@ function mapPaymentOptions(data: any): PaymentOptions {
   };
 }
 
+export type SwiggyToolInfo = { names: string[]; checkoutSchema: unknown; paymentSchema: unknown; updateCartSchema: unknown; fetchedAt: string };
+
+/** tools/list snapshot for the owner dashboard — lets us read the real checkout argument enums. */
+export async function describeSwiggyTools(force = false): Promise<SwiggyToolInfo> {
+  const store = getStore();
+  const cached = force ? null : await store.getKV<SwiggyToolInfo>("swiggy_tools");
+  if (cached) return cached;
+  const conn = await connect();
+  const res = await conn.client.listTools();
+  const find = (n: string) => res.tools.find((t) => t.name === n)?.inputSchema ?? null;
+  const info: SwiggyToolInfo = {
+    names: res.tools.map((t) => t.name).sort(),
+    checkoutSchema: find("checkout"),
+    paymentSchema: find("get_payment_options"),
+    updateCartSchema: find("update_cart"),
+    fetchedAt: new Date().toISOString(),
+  };
+  await store.setKV("swiggy_tools", info, 24 * 3600_000);
+  return info;
+}
+
 /** Payment method strings the checkout tool accepts. TODO(phase0): confirm exact values from the spike. */
 const PAYMENT_METHOD_ARG: Record<PaymentMethod, string> = {
   SWIGGY_MONEY: "SwiggyPay",

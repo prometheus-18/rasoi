@@ -5,7 +5,7 @@
 
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
-import { json, requireDraft } from "@/lib/api";
+import { json, msg, requireDraft } from "@/lib/api";
 import { getProvider } from "@/lib/commerce/provider";
 import { getStore } from "@/lib/store";
 import type { DraftState, MatchedItem, PaymentMethod } from "@/lib/types";
@@ -27,11 +27,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
 
   const body = zBody.safeParse(await req.json().catch(() => null));
   if (!body.success) return json({ error: "bad_request" }, 400);
-  if (!body.data.lines.length) return json({ error: "empty", hi: "कुछ भी चुना नहीं है" }, 400);
+  if (!body.data.lines.length) return msg("nothing_chosen", { error: "empty" }, 400);
 
   const store = getStore();
   if (!(await store.acquireLock(id, 10 * 60_000, "cart")))
-    return json({ error: "busy", hi: "कोई और ऑर्डर चल रहा है — थोड़ी देर रुकें" }, 409);
+    return msg("busy", { error: "busy" }, 409);
 
   // Fresh read right before mutating the shared Swiggy cart: the confirm may have landed meanwhile.
   const fresh = await store.getDraft(id);
@@ -57,12 +57,12 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     const saved = await store.casDraft(id, EDITABLE, { state: "cart_synced", cart: view, totalPaise: view.toPayPaise, paymentMethod, matched });
     if (!saved) {
       // the draft moved on (confirmed) while we were syncing — do not report this cart as current
-      return json({ error: "bad_state", state: "changed", hi: "लिस्ट पक्की हो चुकी है" }, 409);
+      return msg("list_locked", { error: "bad_state", state: "changed" }, 409);
     }
     return json({ cart: view, paymentMethod, version: saved.version });
   } catch (e) {
-    const msg = String((e as Error).message ?? e);
-    await store.audit("cart_sync_failed", { draftId: id, data: { msg } });
-    return json({ error: "cart_failed", hi: "दुकान से जवाब नहीं मिला — फिर कोशिश करें", detail: msg.slice(0, 200) }, 502);
+    const message = String((e as Error).message ?? e);
+    await store.audit("cart_sync_failed", { draftId: id, data: { msg: message } });
+    return msg("shop_no_reply", { error: "cart_failed", detail: message.slice(0, 200) }, 502);
   }
 }

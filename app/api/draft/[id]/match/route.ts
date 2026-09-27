@@ -3,7 +3,7 @@
 // list on Telegram, and the cook sees "मालिक को भेज दिया ✓" (never a dead end).
 
 import { NextResponse, type NextRequest } from "next/server";
-import { json, requireDraft } from "@/lib/api";
+import { json, msg, requireDraft } from "@/lib/api";
 import { getProvider } from "@/lib/commerce/provider";
 import { CommerceError } from "@/lib/commerce/swiggy-errors";
 import { sendOwner } from "@/lib/notify/telegram";
@@ -43,6 +43,6 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     await sendOwner(
       `${loginNeeded ? "🔑 Swiggy login has expired" : "⚠️ Swiggy is not responding"} — the cook's list could not be priced. Here it is:\n${list}\n\nHeard: "${draft.transcript ?? ""}"\n${loginNeeded ? "Send /login to fix it." : "Try again in a few minutes."}`,
     );
-    return json({ error: loginNeeded ? "login_needed" : "swiggy_down", hi: "मालिक को भेज दिया ✓ — वो मंगा देंगे" }, 502);
+    return msg("forwarded", { error: loginNeeded ? "login_needed" : "swiggy_down" }, 502);
   }
 }

@@ -91,7 +91,7 @@ export class MockProvider implements CommerceProvider {
   }
 
   async getPaymentOptions(): Promise<PaymentOptions> {
-    return { swiggyMoney: { available: true, balancePaise: 50000 }, cod: { available: true } };
+    return { cod: { available: true } }; // Swiggy MCP: COD only today
   }
 
   async checkoutOnce(): Promise<RawCheckoutOutcome> {
@@ -144,7 +144,7 @@ export class MockProvider implements CommerceProvider {
       removedOutOfStock: [],
       reducedQuantity: [],
       selectedAddressId: "mock-address",
-      paymentOptions: { swiggyMoney: { available: true, balancePaise: 50000 }, cod: { available: true } },
+      paymentOptions: { cod: { available: true } },
     };
   }
 }

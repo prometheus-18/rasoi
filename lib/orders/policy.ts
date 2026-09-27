@@ -57,8 +57,9 @@ export const DEFAULT_LIMITS: Limits = {
   ordersPerDay: 3,
   maxUnitsPerItem: 5,
   maxKgPerItem: 5,
-  codPerOrderPaise: 600_00,
-  codOrdersPerDay: 1,
+  // Swiggy MCP currently supports COD only, so COD caps equal the general caps
+  codPerOrderPaise: 1000_00,
+  codOrdersPerDay: 3,
   lineApprovalPaise: 400_00,
   neverOrderedApprovalPaise: 150_00,
   orderStartMinute: 6 * 60,

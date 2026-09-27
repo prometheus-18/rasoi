@@ -1,22 +1,27 @@
 "use client";
 
-// S5: order outcome + live tracking. Hindi TTS on state changes.
+// S5: order outcome + live tracking. Speaks state changes in the chosen language.
 
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/client/api";
 import { productEmoji } from "@/lib/client/emoji";
-import { speakHi } from "@/lib/client/tts";
+import { speak } from "@/lib/client/tts";
+import { useLang } from "@/lib/client/use-lang";
+import { pick, ui, type UiKey } from "@/lib/i18n";
+import { LangToggle } from "@/components/LangToggle";
 
 type Status = {
   state: string;
   stateHi: string;
-  error?: string | null;
+  stateEn: string;
+  errorHi?: string | null;
+  errorEn?: string | null;
   cart?: { items: { spinId: string; name: string; quantity: number }[]; toPayPaise: number } | null;
   paymentMethod?: "SWIGGY_MONEY" | "COD" | null;
   swiggyMessage?: string | null;
   dry?: boolean;
-  track?: { status?: string; etaMinutes?: number; message?: string } | null;
+  track?: { status?: string; etaMinutes?: number } | null;
 };
 
 const ru = (p?: number | null) => {
@@ -35,8 +40,12 @@ const ICON: Record<string, string> = {
 };
 
 export function StatusClient({ draftId }: { draftId: string }) {
+  const [lang] = useLang();
+  const t = (k: UiKey, vars?: Record<string, string | number>) => ui(k, lang, vars);
   const [s, setS] = useState<Status | null>(null);
   const lastState = useRef("");
+  const langRef = useRef(lang);
+  langRef.current = lang;
 
   useEffect(() => {
     let stop = false;
@@ -47,12 +56,12 @@ export function StatusClient({ draftId }: { draftId: string }) {
         setS(res);
         if (res.state !== lastState.current) {
           lastState.current = res.state;
-          void speakHi(res.stateHi);
+          void speak(pick(langRef.current, { hi: res.stateHi, en: res.stateEn }), langRef.current);
         }
       } catch {}
     }
     void load();
-    const t = setInterval(() => {
+    const tm = setInterval(() => {
       if (document.visibilityState === "visible") void load();
     }, 40_000);
     const onVisible = () => {
@@ -61,7 +70,7 @@ export function StatusClient({ draftId }: { draftId: string }) {
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       stop = true;
-      clearInterval(t);
+      clearInterval(tm);
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [draftId]);
@@ -75,24 +84,28 @@ export function StatusClient({ draftId }: { draftId: string }) {
 
   const icon = ICON[s.state] ?? "⏳";
   const good = s.state === "placed";
+  const errorText = pick(lang, { hi: s.errorHi, en: s.errorEn });
 
   return (
-    <main className="mx-auto flex min-h-dvh max-w-md flex-col items-center px-6 pb-10 pt-16 text-center">
-      <div className={`text-8xl ${good ? "animate-bob" : ""}`}>{icon}</div>
-      <h1 className="mt-4 text-4xl font-extrabold leading-snug">{s.stateHi}</h1>
-      {s.dry && <p className="mt-2 rounded-xl bg-card px-4 py-1 text-lg font-bold text-faint">डेमो — असली ऑर्डर नहीं हुआ</p>}
-      {s.error && !good && <p className="mt-3 text-xl font-semibold text-danger">{s.error}</p>}
+    <main className="mx-auto flex min-h-dvh max-w-md flex-col items-center px-6 pb-10 pt-4 text-center">
+      <div className="flex w-full justify-end">
+        <LangToggle />
+      </div>
+      <div className={`mt-8 text-8xl ${good ? "animate-bob" : ""}`}>{icon}</div>
+      <h1 className="mt-4 text-4xl font-extrabold leading-snug">{pick(lang, { hi: s.stateHi, en: s.stateEn })}</h1>
+      {s.dry && <p className="mt-2 rounded-xl bg-card px-4 py-1 text-lg font-bold text-faint">{t("demo_no_order")}</p>}
+      {errorText && !good && <p className="mt-3 text-xl font-semibold text-danger">{errorText}</p>}
       {s.swiggyMessage && <p className="mt-3 rounded-2xl bg-card px-4 py-3 text-lg text-faint">Swiggy: “{s.swiggyMessage}”</p>}
 
       {good && s.track && (
         <p className="mt-4 rounded-2xl bg-card px-5 py-3 text-2xl font-bold shadow-sm">
-          🛵 {s.track.status === "DELIVERED" ? "पहुंच गया" : "रास्ते में"}
-          {s.track.etaMinutes ? ` · ~${s.track.etaMinutes} मिनट` : ""}
+          🛵 {s.track.status === "DELIVERED" ? t("delivered") : t("on_the_way")}
+          {s.track.etaMinutes ? ` · ~${s.track.etaMinutes} ${t("minutes")}` : ""}
         </p>
       )}
 
       {good && s.paymentMethod === "COD" && (
-        <p className="mt-4 rounded-2xl bg-warn-bg px-5 py-4 text-2xl font-extrabold text-warn">💵 कैश तैयार रखें {ru(s.cart?.toPayPaise)}</p>
+        <p className="mt-4 rounded-2xl bg-warn-bg px-5 py-4 text-2xl font-extrabold text-warn">{t("keep_cash", { amt: ru(s.cart?.toPayPaise) })}</p>
       )}
 
       {s.cart && (
@@ -106,13 +119,11 @@ export function StatusClient({ draftId }: { draftId: string }) {
       )}
       {s.cart && <p className="mt-2 text-2xl font-extrabold">{ru(s.cart.toPayPaise)}</p>}
 
-      {(s.state === "not_placed" || s.state === "rejected" || s.state === "expired") && (
-        <p className="mt-4 text-xl font-semibold text-faint">बदलकर फिर से बोल सकते हैं</p>
-      )}
-      {s.state === "unknown" && <p className="mt-4 text-xl font-bold text-warn">दोबारा ऑर्डर मत करना — मालिक देख रहे हैं</p>}
+      {(s.state === "not_placed" || s.state === "rejected" || s.state === "expired") && <p className="mt-4 text-xl font-semibold text-faint">{t("change_and_retry")}</p>}
+      {s.state === "unknown" && <p className="mt-4 text-xl font-bold text-warn">{t("do_not_reorder")}</p>}
 
       <Link href="/" className="mt-auto flex h-16 w-full items-center justify-center rounded-2xl bg-brand text-2xl font-extrabold text-white shadow-lg">
-        🏠 वापस
+        {t("home")}
       </Link>
     </main>
   );

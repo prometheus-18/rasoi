@@ -193,6 +193,9 @@ function Shell({ children }: { children: React.ReactNode }) {
   return (
     <main className="mx-auto flex min-h-dvh max-w-2xl flex-col gap-4 px-5 py-8">
       <h1 className="text-3xl font-extrabold">Rasoi — owner dashboard</h1>
+      <p className="text-sm">
+        <a href="/login" className="font-bold text-brand underline">Connect Swiggy / pin address →</a>
+      </p>
       {children}
     </main>
   );

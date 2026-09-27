@@ -3,7 +3,7 @@
 // On total failure the OWNER is told (forward-on-failure) before the cook is told "मालिक को बता दिया".
 
 import { NextResponse, type NextRequest } from "next/server";
-import { json, requireDevice } from "@/lib/api";
+import { json, msg, requireDevice } from "@/lib/api";
 import { sendOwner } from "@/lib/notify/telegram";
 import { istDayStart } from "@/lib/orders/policy";
 import { getStore } from "@/lib/store";
@@ -19,12 +19,12 @@ export async function POST(req: NextRequest) {
   const store = getStore();
 
   const today = await store.countDraftsSince(auth.device.id, istDayStart(new Date()));
-  if (today >= 30) return json({ error: "rate_limited", hi: "आज के लिए बहुत हो गया — कल फिर बोलें" }, 429);
+  if (today >= 30) return msg("rate_limited_voice", { error: "rate_limited" }, 429);
 
   const mime = (req.headers.get("content-type") ?? "audio/webm").split(";")[0];
   const body = await req.arrayBuffer();
-  if (body.byteLength > MAX_BYTES) return json({ error: "too_large", hi: "बहुत लंबा हो गया — छोटा बोलें" }, 413);
-  if (body.byteLength < 500) return json({ error: "too_short", hi: "कुछ सुनाई नहीं दिया — फिर से बोलें" }, 400);
+  if (body.byteLength > MAX_BYTES) return msg("too_long", { error: "too_large" }, 413);
+  if (body.byteLength < 500) return msg("nothing_heard", { error: "too_short" }, 400);
 
   const draft = await store.createDraft({ deviceId: auth.device.id, state: "recorded" });
   const t0 = Date.now();
@@ -32,7 +32,7 @@ export async function POST(req: NextRequest) {
     const parsed = await parseGroceryAudio(new Uint8Array(body), mime);
     if (!parsed.items.length) {
       await store.updateDraftFields(draft.id, { error: "no_items", meta: { path: parsed.path, errors: parsed.errors } });
-      return json({ error: "no_items", hi: "सामान समझ नहीं आया — फिर से बोलें", transcript: parsed.transcript }, 422);
+      return msg("no_items", { error: "no_items", transcript: parsed.transcript }, 422);
     }
     const updated = await store.casDraft(draft.id, ["recorded"], {
       state: "parsed",
@@ -62,9 +62,6 @@ export async function POST(req: NextRequest) {
     await sendOwner(
       `🎤 Voice note from "${auth.device.name}" could not be understood${err.quota ? " (API quota exhausted)" : ""}. Ask the cook what they need.\n${err.errors.slice(0, 3).join("\n")}`,
     );
-    return json(
-      { error: "parse_failed", quota: err.quota, hi: err.quota ? "आज की सुनने की सीमा खत्म — मालिक को बता दिया" : "समझ नहीं आया — फिर से बोलें (मालिक को बता दिया)" },
-      502,
-    );
+    return msg(err.quota ? "quota_out" : "parse_failed", { error: "parse_failed", quota: err.quota }, 502);
   }
 }

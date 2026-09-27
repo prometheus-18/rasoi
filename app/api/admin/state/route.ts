@@ -26,11 +26,14 @@ export async function GET(req: NextRequest) {
 
   let addresses: (Address & { pinned: boolean })[] = [];
   let addressError: string | null = null;
+  let tools: unknown = null;
   if (login.loggedIn) {
     try {
       const provider = await getProvider();
       if (provider.name === "swiggy") {
         addresses = (await provider.getAddresses()).map((a) => ({ ...a, pinned: a.id === env.pinnedAddressId }));
+        const { describeSwiggyTools } = await import("@/lib/commerce/swiggy");
+        tools = await describeSwiggyTools().catch(() => null);
       }
     } catch (e) {
       addressError = String((e as Error).message).slice(0, 200);
@@ -47,6 +50,7 @@ export async function GET(req: NextRequest) {
     pinnedAddressId: env.pinnedAddressId ?? null,
     addresses,
     addressError,
+    tools,
     devices: devices.map((d) => ({ id: d.id, name: d.name, locked: d.locked, revoked: d.revoked, lastSeen: d.lastSeen, createdAt: d.createdAt })),
     orders: orders.map((o) => ({ id: o.id, state: o.state, totalPaise: o.totalPaise, paymentMethod: o.paymentMethod, createdAt: o.createdAt, swiggyOrderIds: o.swiggyOrderIds })),
     unknownCount: unknowns.length,

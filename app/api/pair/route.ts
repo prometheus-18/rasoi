@@ -4,7 +4,7 @@
 
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
-import { json } from "@/lib/api";
+import { json, msg } from "@/lib/api";
 import { claimDemoDevice, claimPairingCode, originOk, setDeviceCookie } from "@/lib/auth/device";
 import { setPinCookie } from "@/lib/auth/pin";
 import { env } from "@/lib/env";
@@ -22,7 +22,7 @@ const LOCK_MS = 60 * 60_000;
 export async function POST(req: NextRequest) {
   if (!originOk(req)) return json({ error: "bad_origin" }, 403);
   const body = zBody.safeParse(await req.json().catch(() => null));
-  if (!body.success) return json({ error: "bad_request", hi: "कोड या पिन ठीक नहीं है" }, 400);
+  if (!body.success) return msg("code_or_pin_bad", { error: "bad_request" }, 400);
   const store = getStore();
 
   if ("demo" in body.data) {
@@ -34,7 +34,7 @@ export async function POST(req: NextRequest) {
     return res;
   }
 
-  if (await store.getKV("pair_locked")) return json({ error: "locked", hi: "अभी कोड नहीं लिया जा सकता — मालिक से पूछें" }, 429);
+  if (await store.getKV("pair_locked")) return msg("pair_locked", { error: "locked" }, 429);
 
   const claimed = await claimPairingCode(body.data.code, body.data.pin, body.data.name);
   if (!claimed) {
@@ -46,7 +46,7 @@ export async function POST(req: NextRequest) {
       await store.setKV("pair_locked", true, LOCK_MS);
       await sendOwner("🔒 Pairing locked for 1 hour after 10 wrong codes.");
     }
-    return json({ error: "bad_code", hi: "कोड गलत या पुराना है — मालिक से नया कोड लें" }, 400);
+    return msg("bad_code", { error: "bad_code" }, 400);
   }
   await store.deleteKV("pair_fails");
   await sendOwner(`📱 New device paired: "${claimed.device.name}". /devices to review, /pause if this wasn't you.`);

@@ -8,7 +8,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Recorder, type Recording } from "@/lib/client/recorder";
-import { speakHi } from "@/lib/client/tts";
+import { speak } from "@/lib/client/tts";
+import { useLang } from "@/lib/client/use-lang";
+import { ui } from "@/lib/i18n";
 
 const MIN_MS = 800;
 const MAX_MS = 60_000;
@@ -23,6 +25,10 @@ type Props = {
 type Mode = "idle" | "starting" | "hold" | "tap";
 
 export function MicButton({ disabled, onRecording, onStart }: Props) {
+  const [lang] = useLang();
+  const langRef = useRef(lang);
+  langRef.current = lang;
+  const t = (k: Parameters<typeof ui>[0]) => ui(k, langRef.current);
   const [mode, setMode] = useState<Mode>("idle");
   const [level, setLevel] = useState(0);
   const [seconds, setSeconds] = useState(0);
@@ -80,7 +86,7 @@ export function MicButton({ disabled, onRecording, onStart }: Props) {
     } catch (e) {
       recRef.current = null;
       setModeSafe("idle");
-      if (String((e as Error)?.message) !== "cancelled") setHint("माइक चालू नहीं हुआ — Chrome में इजाज़त दें");
+      if (String((e as Error)?.message) !== "cancelled") setHint(t("mic_failed"));
       return;
     }
     if (!mounted.current || recRef.current !== rec) {
@@ -93,7 +99,7 @@ export function MicButton({ disabled, onRecording, onStart }: Props) {
         rec.cancel();
         recRef.current = null;
         setModeSafe("idle");
-        setHint("दबाकर रखें और बोलें");
+        setHint(t("hold_hint"));
         return;
       }
     }
@@ -121,8 +127,8 @@ export function MicButton({ disabled, onRecording, onStart }: Props) {
     if (!mounted.current) return;
     setLevel(0);
     if (r.durationMs < MIN_MS || r.blob.size < 800) {
-      setHint("दबाकर रखें और बोलें");
-      void speakHi("दबाकर रखिए और बोलिए");
+      setHint(t("hold_hint"));
+      void speak(t("hold_hint_speech"), langRef.current);
       return;
     }
     onRecording(r);
@@ -171,7 +177,7 @@ export function MicButton({ disabled, onRecording, onStart }: Props) {
         )}
         <button
           type="button"
-          aria-label="बोलने के लिए दबाएं"
+          aria-label={t("mic_aria")}
           disabled={disabled}
           onPointerDown={onPointerDown}
           onPointerUp={onPointerUp}
@@ -191,10 +197,10 @@ export function MicButton({ disabled, onRecording, onStart }: Props) {
 
       {mode === "tap" ? (
         <button type="button" onClick={() => void finish()} className="rounded-full bg-go px-10 py-3 text-2xl font-bold text-white shadow-lg active:scale-95">
-          भेजो ➤
+          {t("send")}
         </button>
       ) : (
-        <p className="text-xl font-semibold text-faint">{listening ? `सुन रहे हैं… ${seconds ? seconds + "s" : ""}` : "दबाकर बोलिए"}</p>
+        <p className="text-xl font-semibold text-faint">{listening ? `${t("listening")} ${seconds ? seconds + "s" : ""}` : t("hold_to_speak")}</p>
       )}
       {hint && <p className="rounded-xl bg-warn-bg px-4 py-2 text-lg font-semibold text-warn">{hint}</p>}
     </div>

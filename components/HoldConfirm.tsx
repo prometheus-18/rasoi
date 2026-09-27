@@ -6,7 +6,7 @@ import { useRef, useState } from "react";
 
 const HOLD_MS = 1500;
 
-export function HoldConfirm({ label, onConfirmed }: { label: string; onConfirmed: () => void }) {
+export function HoldConfirm({ label, holdingLabel, onConfirmed }: { label: string; holdingLabel: string; onConfirmed: () => void }) {
   const [progress, setProgress] = useState(0);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startRef = useRef(0);
@@ -51,7 +51,7 @@ export function HoldConfirm({ label, onConfirmed }: { label: string; onConfirmed
       className="mic-safe relative h-16 w-full overflow-hidden rounded-2xl bg-go text-2xl font-extrabold text-white shadow-lg select-none"
     >
       <span className="absolute inset-0 bg-go-deep transition-none" style={{ width: `${progress * 100}%` }} />
-      <span className="relative z-10">{progress > 0 && progress < 1 ? "दबाए रखें…" : label}</span>
+      <span className="relative z-10">{progress > 0 && progress < 1 ? holdingLabel : label}</span>
     </button>
   );
 }

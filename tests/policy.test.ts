@@ -59,9 +59,10 @@ describe("evaluatePolicy", () => {
   it("blocklist words", () => {
     expect(codes(base({ lines: [{ name: "Amazon Gift Card", linePaise: 100_00 }] }))).toContain("BLOCKLIST");
   });
-  it("COD per-order and per-day limits", () => {
-    expect(codes(base({ paymentMethod: "COD", toPayPaise: 700_00 }))).toContain("COD_LIMIT");
-    expect(codes(base({ paymentMethod: "COD", codOrdersToday: 1 }))).toContain("COD_COUNT");
+  it("COD per-order and per-day limits (when configured tighter than general)", () => {
+    const limits = { ...DEFAULT_LIMITS, supervised: false, codPerOrderPaise: 600_00, codOrdersPerDay: 1 };
+    expect(codes(base({ paymentMethod: "COD", toPayPaise: 700_00, limits }))).toContain("COD_LIMIT");
+    expect(codes(base({ paymentMethod: "COD", codOrdersToday: 1, limits }))).toContain("COD_COUNT");
   });
   it("outside ordering hours (23:00 IST)", () => {
     expect(codes(base({ now: IST_NIGHT }))).toContain("OUTSIDE_HOURS");
