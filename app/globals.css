@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+/* रसोई — warm kitchen palette, fixed light theme (daylight kitchen use), huge tap targets. */
+@theme {
+  --color-bg: #fff8ee;
+  --color-card: #ffffff;
+  --color-ink: #2a1e17;
+  --color-faint: #8a7a6d;
+  --color-line: #f0e3d0;
+  --color-brand: #e85d26;
+  --color-brand-deep: #c2410c;
+  --color-go: #16a34a;
+  --color-go-deep: #15803d;
+  --color-danger: #dc2626;
+  --color-warn: #d97706;
+  --color-warn-bg: #fef3c7;
+
+  --font-sans: var(--font-baloo), "Noto Sans Devanagari", system-ui, sans-serif;
+
+  --radius-card: 1.25rem;
+
+  --animate-pulse-ring: pulse-ring 1.6s cubic-bezier(0.2, 0.6, 0.4, 1) infinite;
+  --animate-bob: bob 2.4s ease-in-out infinite;
+
+  @keyframes pulse-ring {
+    0% {
+      transform: scale(1);
+      opacity: 0.55;
+    }
+    100% {
+      transform: scale(1.9);
+      opacity: 0;
+    }
+  }
+  @keyframes bob {
+    0%,
+    100% {
+      transform: translateY(0);
+    }
+    50% {
+      transform: translateY(-4px);
+    }
+  }
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+  user-select: none;
+}
+
+/* every control is at least a fat finger wide */
+button {
+  touch-action: manipulation;
+  min-height: 48px;
+}
+
+input {
+  user-select: text;
+}
+
+.mic-safe {
+  touch-action: none;
+}

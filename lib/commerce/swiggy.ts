@@ -1,0 +1,323 @@
+// Swiggy Instamart MCP adapter.
+// SAFETY PROPERTIES (enforced here, not in prompts):
+//  - Tool ALLOWLIST: only the 12 tools below are callable. create_address/delete_address etc. are not.
+//  - checkoutOnce() is called only by lib/orders/checkout.ts, is NEVER retried, and refuses to run
+//    unless ALLOW_REAL_ORDERS=true in the Vercel Production environment.
+//  - updateCart always pins the owner's PINNED_ADDRESS_ID.
+//  - One MCP session per user: the Mcp-Session-Id is persisted in the DB and reused.
+
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import type { Address, CommerceProvider } from "@/lib/commerce/provider";
+import { getSwiggyAccessToken } from "@/lib/commerce/swiggy-auth";
+import { classifyFailure, CommerceError } from "@/lib/commerce/swiggy-errors";
+import { env } from "@/lib/env";
+import { getStore } from "@/lib/store";
+import { paise, type CartLine, type CartView, type PaymentMethod, type PaymentOptions, type Product, type ProviderOrder, type RawCheckoutOutcome, type TrackInfo } from "@/lib/types";
+
+const ALLOWED_TOOLS = new Set([
+  "search_products",
+  "your_go_to_items",
+  "get_addresses",
+  "update_cart",
+  "clear_cart",
+  "get_cart",
+  "get_payment_options",
+  "checkout",
+  "get_orders",
+  "get_order_details",
+  "track_order",
+  "get_delivery_status",
+]);
+
+const CALL_TIMEOUT_MS = 18_000;
+const CHECKOUT_TIMEOUT_MS = 30_000;
+
+type Payload = { ok: boolean; data: any; message?: string; raw: unknown };
+
+type CachedConn = { client: Client; transport: StreamableHTTPClientTransport; tokenHash: string };
+const g = globalThis as unknown as { __swiggyConn?: CachedConn };
+
+async function connect(forceFresh = false): Promise<CachedConn> {
+  const token = await getSwiggyAccessToken();
+  const tokenHash = token.slice(-16);
+  if (!forceFresh && g.__swiggyConn && g.__swiggyConn.tokenHash === tokenHash) return g.__swiggyConn;
+
+  const store = getStore();
+  const auth = await store.getSwiggyAuth();
+  const transport = new StreamableHTTPClientTransport(new URL(env.swiggyMcpUrl), {
+    requestInit: { headers: { Authorization: `Bearer ${token}` } },
+    ...(!forceFresh && auth?.sessionId ? { sessionId: auth.sessionId } : {}),
+  });
+  const client = new Client({ name: "rasoi", version: "0.1.0" });
+  await client.connect(transport);
+  if (transport.sessionId && transport.sessionId !== auth?.sessionId) {
+    await store.setSwiggySessionId(transport.sessionId).catch(() => {});
+  }
+  g.__swiggyConn = { client, transport, tokenHash };
+  return g.__swiggyConn;
+}
+
+function parsePayload(r: any): Payload {
+  let payload: any = r.structuredContent;
+  if (payload === undefined) {
+    const text = (r.content ?? [])
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join("\n");
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { text };
+    }
+  }
+  const ok = !r.isError && payload?.success !== false;
+  return { ok, data: payload?.data ?? payload, message: payload?.message ?? payload?.error?.message, raw: r };
+}
+
+/** One raw tools/call. Throws CommerceError on failure. */
+async function rawCall(name: string, args: Record<string, unknown>, timeoutMs: number): Promise<Payload> {
+  if (!ALLOWED_TOOLS.has(name)) throw new CommerceError("CONFIG", `tool '${name}' is not on the allowlist`);
+  let conn: CachedConn;
+  try {
+    conn = await connect();
+  } catch (e) {
+    if (e instanceof CommerceError) throw e;
+    throw new CommerceError("TRANSIENT", `connect failed: ${String((e as Error)?.message ?? e)}`);
+  }
+  let r: any;
+  try {
+    r = await conn.client.request({ method: "tools/call", params: { name, arguments: args } }, CallToolResultSchema, { timeout: timeoutMs });
+  } catch (e: any) {
+    g.__swiggyConn = undefined; // session may be dead; next call reconnects
+    const msg = String(e?.message ?? e);
+    const code = classifyFailure(e?.status ?? e?.code, msg);
+    throw new CommerceError(code === "UNKNOWN" ? "TRANSIENT" : code, `${name}: ${msg}`, { raw: String(e) });
+  }
+  const p = parsePayload(r);
+  if (!p.ok) {
+    const msg = p.message ?? JSON.stringify(p.data)?.slice(0, 300) ?? "tool error";
+    throw new CommerceError(classifyFailure(undefined, msg), `${name}: ${msg}`, { raw: p.raw });
+  }
+  return p;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Retry wrapper. reads: up to 5 attempts. cart: up to 2. checkout NEVER goes through here. */
+async function call(name: string, args: Record<string, unknown>, kind: "read" | "cart"): Promise<Payload> {
+  if (name === "checkout") throw new CommerceError("CONFIG", "checkout must not go through the retry wrapper");
+  const maxAttempts = kind === "read" ? 5 : 2;
+  let lastErr: CommerceError | undefined;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      if (attempt > 0) await sleep(Math.min(400 * 2 ** attempt + Math.random() * 200, 4000));
+      return await rawCall(name, args, CALL_TIMEOUT_MS);
+    } catch (e) {
+      lastErr = e instanceof CommerceError ? e : new CommerceError("UNKNOWN", String((e as Error)?.message ?? e));
+      if (!lastErr.retryable) throw lastErr;
+      if (lastErr.code === "SESSION_419") {
+        try {
+          await connect(true);
+        } catch {
+          /* next attempt reconnects */
+        }
+      }
+    }
+  }
+  throw lastErr!;
+}
+
+// ── payload mappers (defensive: Phase 0 spike will confirm exact shapes) ─────
+
+function mapImage(p: any): string | undefined {
+  if (typeof p?.imageUrl === "string" && p.imageUrl.startsWith("http")) return p.imageUrl;
+  const id = p?.imageId ?? p?.image_id ?? p?.image;
+  if (typeof id === "string" && id.length > 3 && !id.startsWith("http"))
+    return `https://media-assets.swiggy.com/swiggy/image/upload/${id}`;
+  if (typeof id === "string" && id.startsWith("http")) return id;
+  return undefined;
+}
+
+function mapProduct(p: any): Product {
+  return {
+    name: String(p?.displayName ?? p?.name ?? "?"),
+    brand: p?.brand ? String(p.brand) : undefined,
+    imageUrl: mapImage(p),
+    variants: ((p?.variations ?? p?.variants ?? []) as any[]).map((v) => ({
+      spinId: String(v?.spinId ?? ""),
+      skuId: String(v?.skuId ?? ""),
+      packDesc: String(v?.quantityDescription ?? v?.packDesc ?? ""),
+      pricePaise: paise(v?.price?.offerPrice ?? v?.price ?? 0),
+      mrpPaise: v?.price?.mrp !== undefined ? paise(v.price.mrp) : undefined,
+      inStock: Boolean(v?.isInStockAndAvailable ?? v?.inStock ?? true),
+    })),
+  };
+}
+
+function mapCart(data: any): CartView {
+  const items = ((data?.items ?? []) as any[]).map((i) => {
+    const line = paise(i?.discountedFinalPrice ?? i?.finalPrice ?? i?.total ?? 0);
+    const qty = Number(i?.quantity ?? 1);
+    return {
+      spinId: String(i?.spinId ?? ""),
+      skuId: String(i?.skuId ?? ""),
+      name: String(i?.itemName ?? i?.name ?? "?"),
+      imageUrl: mapImage(i),
+      packDesc: i?.quantityDescription ? String(i.quantityDescription) : undefined,
+      quantity: qty,
+      unitPaise: qty > 0 ? Math.round(line / qty) : line,
+      linePaise: line,
+    };
+  });
+  const bill = data?.billBreakdown ?? {};
+  const toPay = paise(bill?.toPay?.value ?? bill?.toPay ?? data?.cartTotalAmount ?? 0);
+  const itemTotal = paise(bill?.itemTotal?.value ?? bill?.itemTotal ?? 0) || items.reduce((s, i) => s + i.linePaise, 0);
+  const warnings: string[] = [];
+  for (const w of [data?.cartWarning, data?.addressWarning]) if (w) warnings.push(String(w));
+  const stores = new Set(((data?.items ?? []) as any[]).map((i) => i?.storeId ?? i?.storeName ?? "s1"));
+  return {
+    items,
+    toPayPaise: toPay,
+    itemTotalPaise: itemTotal,
+    feesPaise: Math.max(0, toPay - itemTotal),
+    storeCount: Math.max(1, stores.size),
+    warnings,
+    removedOutOfStock: ((data?.removedOutOfStockItems ?? []) as any[]).map((x) => String(x?.itemName ?? x)),
+    reducedQuantity: ((data?.reducedQuantityItems ?? []) as any[]).map((x) => String(x?.itemName ?? x)),
+    selectedAddressId: data?.selectedAddressDetails?.id ? String(data.selectedAddressDetails.id) : undefined,
+  };
+}
+
+function mapPaymentOptions(data: any): PaymentOptions {
+  return {
+    swiggyMoney: data?.swiggyMoney
+      ? { available: Boolean(data.swiggyMoney.available), balancePaise: data.swiggyMoney.balance !== undefined ? paise(data.swiggyMoney.balance) : undefined }
+      : undefined,
+    cod: data?.cod ? { available: Boolean(data.cod.available) } : undefined,
+  };
+}
+
+/** Payment method strings the checkout tool accepts. TODO(phase0): confirm exact values from the spike. */
+const PAYMENT_METHOD_ARG: Record<PaymentMethod, string> = {
+  SWIGGY_MONEY: "SwiggyPay",
+  COD: "Cash",
+};
+
+export class SwiggyProvider implements CommerceProvider {
+  readonly name = "swiggy" as const;
+
+  private pinnedAddressId(): string {
+    if (!env.pinnedAddressId) throw new CommerceError("CONFIG", "PINNED_ADDRESS_ID is not set");
+    return env.pinnedAddressId;
+  }
+
+  async searchProducts(query: string): Promise<Product[]> {
+    const p = await call("search_products", { addressId: this.pinnedAddressId(), query }, "read");
+    return ((p.data?.products ?? []) as any[]).map(mapProduct);
+  }
+
+  async goToItems(): Promise<Product[]> {
+    const p = await call("your_go_to_items", { addressId: this.pinnedAddressId() }, "read");
+    return ((p.data?.products ?? []) as any[]).map(mapProduct);
+  }
+
+  async getAddresses(): Promise<Address[]> {
+    const p = await call("get_addresses", { page: 1, pageSize: 10 }, "read");
+    return ((p.data?.addresses ?? []) as any[]).map((a) => ({
+      id: String(a?.id ?? ""),
+      label: a?.addressTag ?? a?.addressCategory ?? undefined,
+      line: a?.addressLine ? String(a.addressLine) : undefined,
+      pincode: a?.pincode ? String(a.pincode) : undefined,
+      lat: a?.lat !== undefined ? Number(a.lat) : undefined,
+      lng: a?.lng !== undefined ? Number(a.lng) : undefined,
+    }));
+  }
+
+  async updateCart(lines: CartLine[]): Promise<CartView> {
+    const p = await call(
+      "update_cart",
+      { selectedAddressId: this.pinnedAddressId(), items: lines.map((l) => ({ spinId: l.spinId, skuId: l.skuId, quantity: l.quantity })) },
+      "cart",
+    );
+    return mapCart(p.data);
+  }
+
+  async getCart(): Promise<CartView> {
+    const p = await call("get_cart", {}, "read");
+    return mapCart(p.data);
+  }
+
+  async clearCart(): Promise<void> {
+    try {
+      await call("clear_cart", {}, "cart");
+    } catch {
+      // issue #58: clear_cart may not work — fall back to replacing with an empty cart
+      await call("update_cart", { selectedAddressId: this.pinnedAddressId(), items: [] }, "cart").catch(() => {});
+    }
+  }
+
+  async getPaymentOptions(): Promise<PaymentOptions> {
+    const p = await call("get_payment_options", {}, "read");
+    return mapPaymentOptions(p.data);
+  }
+
+  /**
+   * THE one checkout call. No retry wrapper, no second attempt, ever.
+   * A timeout or ambiguous response returns kind:"unknown" — the caller must reconcile,
+   * never re-call.
+   */
+  async checkoutOnce(args: { addressId: string; paymentMethod: PaymentMethod }): Promise<RawCheckoutOutcome> {
+    if (!env.allowRealOrders) {
+      throw new CommerceError("CONFIG", "ALLOW_REAL_ORDERS is not enabled in this environment — refusing real checkout");
+    }
+    const method = PAYMENT_METHOD_ARG[args.paymentMethod];
+    if (!method) throw new CommerceError("CONFIG", `unsupported payment method ${args.paymentMethod}`);
+    try {
+      const p = await rawCall("checkout", { addressId: args.addressId, paymentMethod: method }, CHECKOUT_TIMEOUT_MS);
+      const orderIds: string[] = [];
+      const d = p.data;
+      if (d?.orderId) orderIds.push(String(d.orderId));
+      for (const o of (d?.orders ?? []) as any[]) if (o?.orderId) orderIds.push(String(o.orderId));
+      return { kind: "placed", orderIds: [...new Set(orderIds)], message: p.message, raw: p.raw };
+    } catch (e) {
+      const err = e instanceof CommerceError ? e : new CommerceError("UNKNOWN", String((e as Error)?.message ?? e));
+      // Definite pre-acceptance failures: auth rejected, 400-class tool errors, payment declined
+      // with an explicit failure payload. Anything ambiguous (timeout, 5xx, parse) is UNKNOWN.
+      if (["AUTH", "SESSION_419", "MIN_ORDER", "UNSERVICEABLE", "CART_EXPIRED", "OOS", "PAYMENT_DECLINED", "CONFIG"].includes(err.code)) {
+        return { kind: "failed_definite", message: err.message, code: err.code, raw: err.raw };
+      }
+      return { kind: "unknown", message: err.message, raw: err.raw };
+    }
+  }
+
+  async getOrders(count = 10): Promise<ProviderOrder[]> {
+    // TODO(phase0): confirm which orderType returns Instamart orders (default is "DASH").
+    const p = await call("get_orders", { count }, "read");
+    return ((p.data?.orders ?? []) as any[]).map((o) => ({
+      orderId: String(o?.orderId ?? ""),
+      createdAt: o?.createdAt ? String(o.createdAt) : undefined,
+      status: o?.status ? String(o.status) : undefined,
+      totalPaise: o?.totalAmount !== undefined ? paise(o.totalAmount) : undefined,
+      paymentMethod: o?.paymentMethod ? String(o.paymentMethod) : undefined,
+      items: ((o?.items ?? []) as any[]).map((i) => ({ name: String(i?.name ?? i?.itemName ?? "?"), quantity: Number(i?.quantity ?? 1) })),
+    }));
+  }
+
+  async getOrderDetails(orderId: string): Promise<unknown> {
+    const p = await call("get_order_details", { orderId }, "read");
+    return p.data;
+  }
+
+  async trackOrder(orderId: string): Promise<TrackInfo> {
+    const p = await call("track_order", { orderId }, "read");
+    const d = p.data;
+    return {
+      status: d?.status ? String(d.status) : undefined,
+      etaMinutes: d?.etaMinutes !== undefined ? Number(d.etaMinutes) : d?.eta !== undefined ? Number(d.eta) : undefined,
+      message: p.message,
+      raw: d,
+    };
+  }
+}
