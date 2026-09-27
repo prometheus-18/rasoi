@@ -12,7 +12,8 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "spike:swiggy": "tsx scripts/spike-swiggy.ts",
-    "spike:voice": "tsx scripts/spike-voice.ts"
+    "spike:voice": "tsx scripts/spike-voice.ts",
+    "db:migrate": "drizzle-kit migrate"
   },
   "dependencies": {
     "@google/genai": "2.24.0",

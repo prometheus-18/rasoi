@@ -3,6 +3,8 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
+  // Next 16 dev would otherwise append its own rules block to the project CLAUDE.md
+  agentRules: false,
   async headers() {
     return [
       {
