@@ -4,6 +4,7 @@
 //  hold > 600 ms → release sends · quick tap → recording starts, "भेजो" stops it
 //  pointercancel → send · min 0.8 s else discard with a hint · max 60 s auto-send
 //  cue (vibrate) after recorder onstart · touch-action:none · setPointerCapture · wake lock
+// Leak-proof: releasing during getUserMedia cancels the pending start; unmount cancels a live recording.
 
 import { useEffect, useRef, useState } from "react";
 import { Recorder, type Recording } from "@/lib/client/recorder";
@@ -19,21 +20,32 @@ type Props = {
   onStart?: () => void;
 };
 
+type Mode = "idle" | "starting" | "hold" | "tap";
+
 export function MicButton({ disabled, onRecording, onStart }: Props) {
-  const [mode, setMode] = useState<"idle" | "starting" | "hold" | "tap">("idle");
+  const [mode, setMode] = useState<Mode>("idle");
   const [level, setLevel] = useState(0);
   const [seconds, setSeconds] = useState(0);
   const [hint, setHint] = useState<string | null>(null);
   const recRef = useRef<Recorder | null>(null);
   const downAtRef = useRef(0);
-  const startedRef = useRef(false);
+  const releasedDuringStart = useRef(false);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const maxRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const wakeRef = useRef<any>(null);
-  const modeRef = useRef<typeof mode>("idle");
+  const wakeRef = useRef<{ release?: () => Promise<void> } | null>(null);
+  const modeRef = useRef<Mode>("idle");
+  const mounted = useRef(true);
   modeRef.current = mode;
 
-  useEffect(() => () => cleanupTimers(), []);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      cleanupTimers();
+      recRef.current?.cancel(); // never leave the mic on after navigating away
+      recRef.current = null;
+    };
+  }, []);
 
   function cleanupTimers() {
     if (tickRef.current) clearInterval(tickRef.current);
@@ -44,45 +56,69 @@ export function MicButton({ disabled, onRecording, onStart }: Props) {
     wakeRef.current = null;
   }
 
+  function setModeSafe(m: Mode) {
+    modeRef.current = m;
+    if (mounted.current) setMode(m);
+  }
+
   async function begin() {
     if (disabled || modeRef.current !== "idle") return;
     setHint(null);
-    setMode("starting");
+    setModeSafe("starting");
     downAtRef.current = Date.now();
-    startedRef.current = false;
+    releasedDuringStart.current = false;
     onStart?.();
     const rec = new Recorder();
-    rec.onLevel = setLevel;
+    rec.onLevel = (l) => mounted.current && setLevel(l);
     recRef.current = rec;
     try {
       await rec.start(() => {
-        startedRef.current = true;
         try {
           navigator.vibrate?.(30);
         } catch {}
       });
-    } catch {
-      setMode("idle");
-      setHint("माइक चालू नहीं हुआ — Chrome में इजाज़त दें");
+    } catch (e) {
+      recRef.current = null;
+      setModeSafe("idle");
+      if (String((e as Error)?.message) !== "cancelled") setHint("माइक चालू नहीं हुआ — Chrome में इजाज़त दें");
       return;
     }
+    if (!mounted.current || recRef.current !== rec) {
+      rec.cancel();
+      return;
+    }
+    if (releasedDuringStart.current) {
+      // finger came up while the mic was still starting: a quick tap → tap mode, a hold → discard
+      if (Date.now() - downAtRef.current > HOLD_MS) {
+        rec.cancel();
+        recRef.current = null;
+        setModeSafe("idle");
+        setHint("दबाकर रखें और बोलें");
+        return;
+      }
+    }
     try {
-      wakeRef.current = await (navigator as any).wakeLock?.request?.("screen");
+      wakeRef.current = await (navigator as Navigator & { wakeLock?: { request: (t: string) => Promise<{ release: () => Promise<void> }> } }).wakeLock?.request?.("screen") ?? null;
     } catch {}
     setSeconds(0);
-    tickRef.current = setInterval(() => setSeconds((s) => s + 1), 1000);
+    tickRef.current = setInterval(() => mounted.current && setSeconds((s) => s + 1), 1000);
     maxRef.current = setTimeout(() => void finish(), MAX_MS);
-    // if the finger is already up (very fast tap), stay in tap mode
-    setMode((m) => (m === "starting" ? (Date.now() - downAtRef.current > HOLD_MS ? "hold" : "tap") : m));
+    setModeSafe(releasedDuringStart.current ? "tap" : "hold");
   }
 
   async function finish() {
     const rec = recRef.current;
     if (!rec || modeRef.current === "idle") return;
-    setMode("idle");
+    setModeSafe("idle");
     cleanupTimers();
-    const r = await rec.stop();
     recRef.current = null;
+    if (!rec.active) {
+      rec.cancel();
+      setLevel(0);
+      return;
+    }
+    const r = await rec.stop();
+    if (!mounted.current) return;
     setLevel(0);
     if (r.durationMs < MIN_MS || r.blob.size < 800) {
       setHint("दबाकर रखें और बोलें");
@@ -103,9 +139,23 @@ export function MicButton({ disabled, onRecording, onStart }: Props) {
 
   function onPointerUp() {
     if (modeRef.current === "idle") return;
+    if (modeRef.current === "starting") {
+      releasedDuringStart.current = true; // begin() decides once the mic is actually up
+      return;
+    }
     const heldMs = Date.now() - downAtRef.current;
     if (heldMs > HOLD_MS) void finish();
-    else setMode("tap"); // quick tap → keep listening until "भेजो"
+    else setModeSafe("tap"); // quick tap → keep listening until "भेजो"
+  }
+
+  function onPointerCancel() {
+    if (modeRef.current === "starting") {
+      recRef.current?.cancel();
+      recRef.current = null;
+      setModeSafe("idle");
+      return;
+    }
+    void finish(); // spec: pointercancel sends
   }
 
   const listening = mode === "hold" || mode === "tap" || mode === "starting";
@@ -125,10 +175,10 @@ export function MicButton({ disabled, onRecording, onStart }: Props) {
           disabled={disabled}
           onPointerDown={onPointerDown}
           onPointerUp={onPointerUp}
-          onPointerCancel={() => void finish()}
+          onPointerCancel={onPointerCancel}
           onContextMenu={(e) => e.preventDefault()}
           className={`mic-safe relative z-10 flex h-44 w-44 items-center justify-center rounded-full shadow-[0_10px_40px_rgba(232,93,38,0.45)] transition-transform select-none ${
-            listening ? "scale-110 bg-gradient-to-b from-brand to-brand-deep" : "bg-gradient-to-b from-[#F97316] to-brand-deep active:scale-95"
+            listening ? "bg-gradient-to-b from-brand to-brand-deep" : "bg-gradient-to-b from-[#F97316] to-brand-deep active:scale-95"
           } ${disabled ? "opacity-40 grayscale" : ""}`}
           style={{ transform: listening ? `scale(${1.08 + level * 0.1})` : undefined }}
         >
@@ -140,11 +190,7 @@ export function MicButton({ disabled, onRecording, onStart }: Props) {
       </div>
 
       {mode === "tap" ? (
-        <button
-          type="button"
-          onClick={() => void finish()}
-          className="rounded-full bg-go px-10 py-3 text-2xl font-bold text-white shadow-lg active:scale-95"
-        >
+        <button type="button" onClick={() => void finish()} className="rounded-full bg-go px-10 py-3 text-2xl font-bold text-white shadow-lg active:scale-95">
           भेजो ➤
         </button>
       ) : (

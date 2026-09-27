@@ -12,6 +12,13 @@ export const env = {
   get geminiApiKey() {
     return process.env.GEMINI_API_KEY || undefined;
   },
+  get groqApiKey() {
+    return process.env.GROQ_API_KEY || undefined;
+  },
+  /** Setup-phase owner login (before the Telegram bot exists): /api/admin/session?key=… */
+  get adminSetupKey() {
+    return process.env.ADMIN_SETUP_KEY || undefined;
+  },
   get telegramBotToken() {
     return process.env.TELEGRAM_BOT_TOKEN || undefined;
   },
@@ -64,6 +71,7 @@ export const env = {
 export type SetupStatus = {
   database: boolean;
   gemini: boolean;
+  groq: boolean;
   telegram: boolean;
   tokenEncKey: boolean;
   pinPepper: boolean;
@@ -77,6 +85,7 @@ export function setupStatus(): SetupStatus {
   return {
     database: Boolean(env.databaseUrl),
     gemini: Boolean(env.geminiApiKey),
+    groq: Boolean(env.groqApiKey),
     telegram: env.telegramConfigured,
     tokenEncKey: Boolean(env.tokenEncKey),
     pinPepper: Boolean(env.pinPepper),

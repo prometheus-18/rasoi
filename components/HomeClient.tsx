@@ -27,7 +27,9 @@ export function HomeClient() {
     const down = () => setOnline(false);
     window.addEventListener("online", up);
     window.addEventListener("offline", down);
-    void ensureReady().then((w) => setWarm(w));
+    void ensureReady()
+      .then((w) => setWarm(w))
+      .catch((e) => setError(e instanceof ApiError ? (e.data?.hi ?? "सर्वर से बात नहीं हो पाई") : "इंटरनेट नहीं चल रहा"));
     return () => {
       window.removeEventListener("online", up);
       window.removeEventListener("offline", down);
@@ -88,7 +90,7 @@ export function HomeClient() {
             <p className="text-2xl font-bold">लिस्ट बन रही है…</p>
           </div>
         ) : (
-          <MicButton disabled={Boolean(banner && online && warm?.paused)} onRecording={onRecording} onStart={() => void api("/api/warm").catch(() => {})} />
+          <MicButton disabled={!online || Boolean(warm?.paused) || Boolean(warm?.blocked)} onRecording={onRecording} onStart={() => void api("/api/warm").catch(() => {})} />
         )}
         {error && <p className="rounded-2xl bg-red-50 px-4 py-3 text-center text-lg font-bold text-danger">{error}</p>}
       </section>

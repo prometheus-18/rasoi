@@ -3,6 +3,7 @@
 // an optional candidate-index-only Gemini call for ambiguous items).
 
 import type { CommerceProvider } from "@/lib/commerce/provider";
+import { CommerceError } from "@/lib/commerce/swiggy-errors";
 import { getStore } from "@/lib/store";
 import type { MatchedItem, Product, ProductVariant, VoiceItem } from "@/lib/types";
 
@@ -30,6 +31,31 @@ function desiredGrams(item: VoiceItem): number | null {
   }
 }
 
+/** Piece count in a pack description like "6 pc", "12 pcs", "1 dozen", "30 pieces"; null if not a count pack. */
+export function packCount(packDesc: string): number | null {
+  const d = packDesc.toLowerCase();
+  if (/dozen/.test(d)) {
+    const n = Number(d.match(/([\d.]+)\s*dozen/)?.[1] ?? 1);
+    return Number.isFinite(n) ? n * 12 : 12;
+  }
+  const m = d.match(/([\d.]+)\s*(pc|pcs|piece|pieces|nos|units?|eggs?)\b/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Desired piece count for count-based units ("ek darjan ande" → 12). */
+function desiredPieces(item: VoiceItem): number | null {
+  switch (item.unit) {
+    case "dozen":
+      return item.qty * 12;
+    case "piece":
+      return item.qty;
+    default:
+      return null;
+  }
+}
+
 function nameScore(product: Product, term: string): number {
   const name = product.name.toLowerCase();
   const t = term.toLowerCase();
@@ -41,17 +67,20 @@ function nameScore(product: Product, term: string): number {
   return words.length ? (hit / words.length) * 2 : 0;
 }
 
+/** Pick the pack whose size fits the requested amount best (weight or piece count). */
 function bestVariant(product: Product, item: VoiceItem): ProductVariant | null {
   const inStock = product.variants.filter((v) => v.inStock);
   if (!inStock.length) return null;
-  const want = desiredGrams(item);
-  if (want === null) return inStock[0];
+  const wantG = desiredGrams(item);
+  const wantN = desiredPieces(item);
+  if (wantG === null && wantN === null) return inStock[0]; // pack/bunch: any pack is fine
   let best = inStock[0];
   let bestFit = Number.POSITIVE_INFINITY;
   for (const v of inStock) {
-    const g = packGrams(v.packDesc);
+    const size = wantG !== null ? packGrams(v.packDesc) : packCount(v.packDesc);
+    const want = (wantG ?? wantN)!;
     // prefer a pack that divides the desired amount cleanly; penalize overshoot
-    const fit = g === null ? 10 : g <= want ? (want % g === 0 ? want / g - 1 : want / g) : (g / want) * 2;
+    const fit = size === null ? 10 : size <= want ? (want % size === 0 ? want / size - 1 : want / size) : (size / want) * 2;
     if (fit < bestFit) {
       bestFit = fit;
       best = v;
@@ -62,14 +91,19 @@ function bestVariant(product: Product, item: VoiceItem): ProductVariant | null {
 
 /** How many units of the chosen variant approximate the requested quantity. */
 export function unitsFor(item: VoiceItem, variant: ProductVariant): number {
-  const want = desiredGrams(item);
-  if (want === null) {
-    const q = item.unit === "dozen" ? item.qty : item.qty; // dozen packs are sold as "12 pc" variants
-    return Math.min(Math.max(1, Math.round(q)), 10);
+  const wantG = desiredGrams(item);
+  if (wantG !== null) {
+    const g = packGrams(variant.packDesc);
+    if (g === null || g <= 0) return 1;
+    return Math.min(Math.max(1, Math.round(wantG / g)), 10);
   }
-  const g = packGrams(variant.packDesc);
-  if (g === null || g <= 0) return 1;
-  return Math.min(Math.max(1, Math.round(want / g)), 10);
+  const wantN = desiredPieces(item);
+  if (wantN !== null) {
+    const n = packCount(variant.packDesc);
+    if (n === null || n <= 0) return Math.min(Math.max(1, Math.round(item.unit === "dozen" ? item.qty : item.qty)), 10);
+    return Math.min(Math.max(1, Math.round(wantN / n)), 10);
+  }
+  return Math.min(Math.max(1, Math.round(item.qty)), 10);
 }
 
 export async function matchItems(provider: CommerceProvider, items: VoiceItem[]): Promise<MatchedItem[]> {
@@ -98,7 +132,9 @@ export async function matchItems(provider: CommerceProvider, items: VoiceItem[])
     let products: Product[] = [];
     try {
       products = await provider.searchProducts(item.search_en);
-    } catch {
+    } catch (e) {
+      // Outage / expired login is a provider failure, not "product does not exist" — let it escape.
+      if (e instanceof CommerceError && ["AUTH", "TRANSIENT", "RATE_LIMIT", "SESSION_419", "CONFIG"].includes(e.code)) throw e;
       return { key, voice: item, status: "not_found", quantity: 1 };
     }
     const scored = products

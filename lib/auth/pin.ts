@@ -2,7 +2,7 @@
 // Peppered scrypt hash; atomic fail counter; 3 fails → owner alert, 5 → locked until /unlock.
 
 import type { NextRequest, NextResponse } from "next/server";
-import { hmacSign, hmacVerify, pinVerify } from "@/lib/crypto";
+import { hmacSign, hmacVerify, pinVerify, randomToken } from "@/lib/crypto";
 import { env } from "@/lib/env";
 import { sendOwner } from "@/lib/notify/telegram";
 import { getStore } from "@/lib/store";
@@ -27,8 +27,13 @@ export async function verifyDevicePin(device: Device, pin: string): Promise<PinR
   return { ok, locked, failsLeft: Math.max(0, 5 - fails) };
 }
 
+const g = globalThis as unknown as { __rasoiPinFallback?: string };
+
+/** PIN_PEPPER, or (demo/dev only) a per-process random secret — never a hardcoded constant. */
 function pinSecret(): string {
-  return env.pinPepper ?? "rasoi-dev-pepper";
+  if (env.pinPepper) return env.pinPepper;
+  if (!g.__rasoiPinFallback) g.__rasoiPinFallback = randomToken(32);
+  return g.__rasoiPinFallback;
 }
 
 export function setPinCookie(res: NextResponse, deviceId: string): void {
@@ -48,8 +53,10 @@ export function pinCookieValid(req: NextRequest, device: Device): boolean {
   if (!device.pinHash) return true;
   const raw = req.cookies.get(PIN_COOKIE)?.value;
   if (!raw) return false;
-  const [deviceId, expStr, sig] = raw.split(".");
-  if (deviceId !== device.id) return false;
+  const parts = raw.split(".");
+  if (parts.length !== 3) return false;
+  const [deviceId, expStr, sig] = parts;
+  if (deviceId !== device.id || !sig) return false;
   const exp = Number(expStr);
   if (!Number.isFinite(exp) || exp < Date.now()) return false;
   return hmacVerify(`${deviceId}.${exp}`, sig, pinSecret());

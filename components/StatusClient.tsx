@@ -19,7 +19,10 @@ type Status = {
   track?: { status?: string; etaMinutes?: number; message?: string } | null;
 };
 
-const ru = (p?: number | null) => `₹${Math.round((p ?? 0) / 100)}`;
+const ru = (p?: number | null) => {
+  const r = (p ?? 0) / 100;
+  return `₹${Number.isInteger(r) ? r : r.toFixed(2)}`;
+};
 
 const ICON: Record<string, string> = {
   placed: "✅",
@@ -52,9 +55,14 @@ export function StatusClient({ draftId }: { draftId: string }) {
     const t = setInterval(() => {
       if (document.visibilityState === "visible") void load();
     }, 40_000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void load();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       stop = true;
       clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [draftId]);
 

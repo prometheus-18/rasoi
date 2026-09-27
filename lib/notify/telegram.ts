@@ -37,6 +37,8 @@ export async function sendOwner(text: string, buttons?: TgButton[][]): Promise<n
   const body = await tg("sendMessage", {
     chat_id: env.ownerChatId,
     text,
+    // never let Telegram's preview crawler fetch our one-time links
+    link_preview_options: { is_disabled: true },
     ...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
   });
   return body?.result?.message_id ?? null;
@@ -52,7 +54,7 @@ export async function answerCallback(callbackQueryId: string, text?: string): Pr
 }
 
 export async function sendChat(chatId: number | string, text: string): Promise<void> {
-  await tg("sendMessage", { chat_id: chatId, text });
+  await tg("sendMessage", { chat_id: chatId, text, link_preview_options: { is_disabled: true } });
 }
 
 // ── Single-use callback tokens (approve/reject and other owner actions) ──────

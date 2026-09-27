@@ -8,7 +8,7 @@ import { json } from "@/lib/api";
 import { isOwnerRequest } from "@/lib/auth/owner";
 import { completeSwiggyPaste } from "@/lib/commerce/swiggy-auth";
 import { sendOwner } from "@/lib/notify/telegram";
-import { resumeWaitingDrafts } from "@/lib/orders/engine";
+import { resumeWaitingDrafts, retryApprovedDrafts } from "@/lib/orders/engine";
 import { runCheckout } from "@/lib/orders/checkout";
 
 export const maxDuration = 300;
@@ -27,6 +27,7 @@ export async function POST(req: NextRequest) {
     const { expiresAt } = await completeSwiggyPaste(body.data.pasted);
     after(async () => {
       const resumed = await resumeWaitingDrafts(runCheckout);
+      await retryApprovedDrafts(runCheckout);
       if (resumed > 0) await sendOwner(`▶️ Login restored — ${resumed} waiting order(s) resumed.`);
     });
     return json({ ok: true, expiresAt: expiresAt.toISOString() });

@@ -21,14 +21,30 @@ account. Runs free on Vercel Hobby (`bom1`) + Neon Postgres. Full plan: `docs/PL
 
 ```bash
 npm install
-npm run dev        # demo mode without env vars: mock catalog, in-memory store, no real anything
-npm test           # policy / engine / checkout-never-retried proofs
+npm run dev        # reads .env.local; without keys = demo mode (mock catalog, in-memory store)
+npm test           # policy / engine / checkout-never-retried / rules-parser proofs
 npm run build
+npx tsx scripts/setup-telegram.ts            # find OWNER_CHAT_ID after tapping Start on the bot
+npx tsx scripts/setup-telegram.ts --webhook  # point the bot at $APP_URL/api/telegram
 ```
 
 With no `DATABASE_URL` the app runs in **demo mode**: auto-paired device, mock products,
-canned voice parse if `GEMINI_API_KEY` is missing, checkout hard-blocked. Set env vars
+checkout hard-blocked. Voice is REAL as soon as `GEMINI_API_KEY` (and/or `GROQ_API_KEY`) is set —
+even in demo mode. Voice paths, in order: Gemini audio → Groq Whisper + Gemini text → Groq Whisper +
+deterministic Hinglish rules parser (`lib/voice/rules.ts`). Set the remaining env vars
 (see `.env.example`) to go real, then `npm run db:push` to create the schema.
+
+## Connecting Swiggy Instamart
+
+1. Deploy (or `npm run dev`) with `DATABASE_URL` + `TOKEN_ENC_KEY` set — the token is stored encrypted in the DB.
+2. Open `/admin` (Telegram `/admin` link, or `/api/admin/session` with `ADMIN_SETUP_KEY` during setup).
+3. "Swiggy login" card → open the login link **in Chrome** → phone + OTP → Chrome shows
+   "localhost — site can't be reached" (expected) → copy the full address-bar URL → paste into the
+   card (or into the Telegram bot chat) within 2 minutes.
+4. The "Delivery address" card now lists your saved Swiggy addresses → copy the home address id
+   into `PINNED_ADDRESS_ID` (Vercel: Production + Sensitive) → redeploy.
+5. The token lasts 5 days; the bot reminds you (<48 h) with a fresh login link. Until Swiggy
+   allowlists the Vercel callback URL this paste-back flow is the only way in.
 
 ## Setup order (owner)
 

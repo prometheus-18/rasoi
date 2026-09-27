@@ -13,6 +13,9 @@ type State = {
   limits: Record<string, unknown> & { supervised: boolean };
   spend: { spentDayPaise: number; spentWeekPaise: number; ordersToday: number };
   login: { loggedIn: boolean; expiresAt?: string; hoursLeft?: number };
+  pinnedAddressId: string | null;
+  addresses: { id: string; label?: string; line?: string; pincode?: string; lat?: number; lng?: number; pinned: boolean }[];
+  addressError: string | null;
   devices: { id: string; name: string; locked: boolean; revoked: boolean; lastSeen?: string }[];
   orders: { id: string; state: string; totalPaise: number; paymentMethod: string; createdAt: string; swiggyOrderIds?: string[] }[];
   unknownCount: number;
@@ -23,6 +26,7 @@ const ru = (p: number) => `₹${Math.round(p / 100)}`;
 const SETUP_LABELS: Record<string, string> = {
   database: "Neon Postgres (DATABASE_URL)",
   gemini: "Gemini key (GEMINI_API_KEY, project rasoi-prod)",
+  groq: "Groq key — Whisper fallback (GROQ_API_KEY)",
   telegram: "Telegram bot (TELEGRAM_BOT_TOKEN + OWNER_CHAT_ID)",
   tokenEncKey: "Token encryption key (TOKEN_ENC_KEY)",
   pinPepper: "PIN pepper (PIN_PEPPER)",
@@ -110,12 +114,37 @@ export function AdminClient() {
 
       <Card title="Swiggy login (paste-back)">
         <p className="text-sm text-faint">
-          Open <a className="font-bold text-brand underline" href="/api/swiggy/login">the login link</a> in Chrome, finish phone+OTP, then copy the full address-bar URL from the “site can’t be reached” page and paste it here (within 2 min):
+          1. Open <a className="font-bold text-brand underline" href="/api/swiggy/login" target="_blank" rel="noreferrer">the Swiggy login link</a> in Chrome and finish the phone + OTP login.
+          <br />
+          2. Chrome lands on a “localhost — site can’t be reached” page. That is expected. Copy the FULL address-bar URL.
+          <br />
+          3. Paste it here within 2 minutes:
         </p>
         <div className="mt-2 flex gap-2">
           <input value={paste} onChange={(e) => setPaste(e.target.value)} placeholder="http://localhost/callback?code=…" className="min-w-0 flex-1 rounded-xl border-2 border-line bg-white p-3 text-sm" />
           <Btn onClick={() => void submitPaste()}>Save</Btn>
         </div>
+        {s.login.loggedIn && (
+          <div className="mt-3 flex items-center justify-between">
+            <span className="text-sm text-faint">Logged in · {s.login.hoursLeft} h left</span>
+            <Btn onClick={() => act({ action: "clear_swiggy_login" }, "Swiggy login deleted")}>Delete login (incident)</Btn>
+          </div>
+        )}
+      </Card>
+
+      <Card title="Delivery address (PINNED_ADDRESS_ID)">
+        {!s.login.loggedIn && <p className="text-sm text-faint">Log in to Swiggy first — the saved addresses show here so you can pin the home address.</p>}
+        {s.addressError && <p className="text-sm text-danger">{s.addressError}</p>}
+        {s.addresses.map((a) => (
+          <div key={a.id} className={`border-b border-line py-2 text-sm last:border-0 ${a.pinned ? "font-bold" : ""}`}>
+            {a.pinned ? "📌 " : ""}
+            {a.label ?? "address"} — {a.line ?? ""} {a.pincode ?? ""}
+            <div className="mt-1 break-all font-mono text-xs text-faint">id: {a.id}</div>
+          </div>
+        ))}
+        {s.login.loggedIn && !s.pinnedAddressId && s.addresses.length > 0 && (
+          <p className="mt-2 rounded-xl bg-warn-bg p-2 text-sm text-warn">Copy the home address id into Vercel as PINNED_ADDRESS_ID (Production, Sensitive) and redeploy. No real order can be placed until then.</p>
+        )}
       </Card>
 
       <Card title="Devices">

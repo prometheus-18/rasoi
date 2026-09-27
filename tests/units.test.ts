@@ -49,8 +49,8 @@ describe("weights and counts for policy", () => {
     expect(itemWeightKg(item({ qty: 500, unit: "g" }))).toBe(0.5);
     expect(itemWeightKg(item({ qty: 2, unit: "pack" }))).toBeNull();
   });
-  it("count units", () => {
-    expect(itemUnitCount(item({ qty: 2, unit: "dozen" }))).toBe(24);
+  it("count units (a dozen is one pack for the limit)", () => {
+    expect(itemUnitCount(item({ qty: 2, unit: "dozen" }))).toBe(2);
     expect(itemUnitCount(item({ qty: 3, unit: "pack" }))).toBe(3);
     expect(itemUnitCount(item({ qty: 1, unit: "kg" }))).toBeNull();
   });

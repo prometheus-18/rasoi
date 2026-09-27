@@ -1,7 +1,9 @@
 // रसोई service worker.
-// Rules: NEVER touch /api. Cache-first for static assets, network-first for pages.
+// Rules: NEVER touch /api. Cache-first for immutable build assets (OK responses only),
+// network-first for page navigations with a cached-page fallback. Non-navigation fetches
+// (Next.js RSC payloads) are never answered from cache — the app's own offline handling runs.
 
-const VERSION = "rasoi-v1";
+const VERSION = "rasoi-v2";
 const STATIC = ["/icon.svg", "/icon-maskable.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
@@ -24,15 +26,17 @@ self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET" || url.origin !== self.location.origin) return;
   if (url.pathname.startsWith("/api/")) return; // never cache API calls
 
-  // immutable build assets: cache-first
+  // immutable build assets: cache-first, only store 200s
   if (url.pathname.startsWith("/_next/static/") || STATIC.includes(url.pathname)) {
     event.respondWith(
       caches.match(event.request).then(
         (hit) =>
           hit ??
           fetch(event.request).then((res) => {
-            const copy = res.clone();
-            caches.open(VERSION).then((c) => c.put(event.request, copy));
+            if (res.ok && res.type === "basic") {
+              const copy = res.clone();
+              caches.open(VERSION).then((c) => c.put(event.request, copy));
+            }
             return res;
           }),
       ),
@@ -40,16 +44,18 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // pages: network-first with cache fallback (offline shows the last-seen page)
-  event.respondWith(
-    fetch(event.request)
-      .then((res) => {
-        if (res.ok && event.request.mode === "navigate") {
-          const copy = res.clone();
-          caches.open(VERSION).then((c) => c.put(event.request, copy));
-        }
-        return res;
-      })
-      .catch(() => caches.match(event.request).then((hit) => hit ?? caches.match("/"))),
-  );
+  // full-page navigations only: network-first, last-seen page when offline
+  if (event.request.mode === "navigate") {
+    event.respondWith(
+      fetch(event.request)
+        .then((res) => {
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(VERSION).then((c) => c.put(event.request, copy));
+          }
+          return res;
+        })
+        .catch(() => caches.match(event.request).then((hit) => hit ?? caches.match("/"))),
+    );
+  }
 });

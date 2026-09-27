@@ -1,8 +1,10 @@
 // POST raw audio bytes → new draft with the parsed grocery list.
 // Auth: device cookie. Rate limit: 30 voice notes per device per IST day.
+// On total failure the OWNER is told (forward-on-failure) before the cook is told "मालिक को बता दिया".
 
 import { NextResponse, type NextRequest } from "next/server";
 import { json, requireDevice } from "@/lib/api";
+import { sendOwner } from "@/lib/notify/telegram";
 import { istDayStart } from "@/lib/orders/policy";
 import { getStore } from "@/lib/store";
 import { parseGroceryAudio, VoiceParseError } from "@/lib/voice/gemini";
@@ -29,28 +31,39 @@ export async function POST(req: NextRequest) {
   try {
     const parsed = await parseGroceryAudio(new Uint8Array(body), mime);
     if (!parsed.items.length) {
-      await store.updateDraftFields(draft.id, { error: "no_items" });
+      await store.updateDraftFields(draft.id, { error: "no_items", meta: { path: parsed.path, errors: parsed.errors } });
       return json({ error: "no_items", hi: "सामान समझ नहीं आया — फिर से बोलें", transcript: parsed.transcript }, 422);
     }
     const updated = await store.casDraft(draft.id, ["recorded"], {
       state: "parsed",
       transcript: parsed.transcript,
       items: parsed.items,
-      meta: { model: parsed.model, parseMs: parsed.ms, audioMs: Date.now() - t0, mime },
+      meta: { model: parsed.model, path: parsed.path, degraded: parsed.degraded, parseMs: parsed.ms, totalMs: Date.now() - t0, mime, errors: parsed.errors },
     });
     await store.supersedeActiveDrafts(auth.device.id, draft.id);
     await store.audit("voice_parsed", {
       draftId: draft.id,
       deviceId: auth.device.id,
-      data: { model: parsed.model, ms: parsed.ms, items: parsed.items.length, bytes: body.byteLength },
+      data: { model: parsed.model, path: parsed.path, ms: parsed.ms, items: parsed.items.length, bytes: body.byteLength, degraded: parsed.degraded },
     });
-    return json({ draftId: draft.id, transcript: parsed.transcript, items: updated?.items ?? parsed.items });
+    if (parsed.degraded && parsed.errors.some((e) => /429|quota|exhausted/i.test(e))) {
+      // still worked via fallback, but the owner should know the primary quota is gone
+      const throttled = await store.getKV("quota_alert_sent");
+      if (!throttled) {
+        await store.setKV("quota_alert_sent", true, 3 * 3600_000);
+        await sendOwner(`ℹ️ Gemini quota exhausted — voice is running on the fallback (${parsed.path}). Resets ~12:30 PM IST.`);
+      }
+    }
+    return json({ draftId: draft.id, transcript: parsed.transcript, items: updated?.items ?? parsed.items, path: parsed.path, degraded: parsed.degraded });
   } catch (e) {
-    const quota = e instanceof VoiceParseError && e.quota;
-    await store.updateDraftFields(draft.id, { error: String((e as Error).message).slice(0, 300) });
-    await store.audit("voice_parse_failed", { draftId: draft.id, deviceId: auth.device.id, data: { quota } });
+    const err = e instanceof VoiceParseError ? e : new VoiceParseError([String((e as Error).message)], false);
+    await store.updateDraftFields(draft.id, { error: err.message.slice(0, 300), meta: { errors: err.errors } });
+    await store.audit("voice_parse_failed", { draftId: draft.id, deviceId: auth.device.id, data: { quota: err.quota, errors: err.errors } });
+    await sendOwner(
+      `🎤 Voice note from "${auth.device.name}" could not be understood${err.quota ? " (API quota exhausted)" : ""}. Ask the cook what they need.\n${err.errors.slice(0, 3).join("\n")}`,
+    );
     return json(
-      { error: "parse_failed", quota, hi: quota ? "आज की सुनने की सीमा खत्म — मालिक को बता दिया" : "समझ नहीं आया — फिर से बोलें" },
+      { error: "parse_failed", quota: err.quota, hi: err.quota ? "आज की सुनने की सीमा खत्म — मालिक को बता दिया" : "समझ नहीं आया — फिर से बोलें (मालिक को बता दिया)" },
       502,
     );
   }

@@ -7,7 +7,7 @@
 //  - One MCP session per user: the Mcp-Session-Id is persisted in the DB and reused.
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Address, CommerceProvider } from "@/lib/commerce/provider";
 import { getSwiggyAccessToken } from "@/lib/commerce/swiggy-auth";
@@ -76,15 +76,15 @@ function parsePayload(r: any): Payload {
   return { ok, data: payload?.data ?? payload, message: payload?.message ?? payload?.error?.message, raw: r };
 }
 
-/** One raw tools/call. Throws CommerceError on failure. */
+/** One raw tools/call. Throws CommerceError (with `source`) on failure. */
 async function rawCall(name: string, args: Record<string, unknown>, timeoutMs: number): Promise<Payload> {
-  if (!ALLOWED_TOOLS.has(name)) throw new CommerceError("CONFIG", `tool '${name}' is not on the allowlist`);
+  if (!ALLOWED_TOOLS.has(name)) throw new CommerceError("CONFIG", `tool '${name}' is not on the allowlist`, { source: "pre-send" });
   let conn: CachedConn;
   try {
     conn = await connect();
   } catch (e) {
-    if (e instanceof CommerceError) throw e;
-    throw new CommerceError("TRANSIENT", `connect failed: ${String((e as Error)?.message ?? e)}`);
+    if (e instanceof CommerceError) throw e; // AUTH from getSwiggyAccessToken → pre-send
+    throw new CommerceError("TRANSIENT", `connect failed: ${String((e as Error)?.message ?? e)}`, { source: "pre-send" });
   }
   let r: any;
   try {
@@ -92,13 +92,15 @@ async function rawCall(name: string, args: Record<string, unknown>, timeoutMs: n
   } catch (e: any) {
     g.__swiggyConn = undefined; // session may be dead; next call reconnects
     const msg = String(e?.message ?? e);
-    const code = classifyFailure(e?.status ?? e?.code, msg);
-    throw new CommerceError(code === "UNKNOWN" ? "TRANSIENT" : code, `${name}: ${msg}`, { raw: String(e) });
+    // HTTP-level status (StreamableHTTPError.code) vs JSON-RPC code (McpError.code, negative)
+    const status = e instanceof StreamableHTTPError ? e.code : typeof e?.status === "number" ? e.status : undefined;
+    const code = classifyFailure(status, msg);
+    throw new CommerceError(code === "UNKNOWN" ? "TRANSIENT" : code, `${name}: ${msg}`, { status, raw: String(e), source: "transport" });
   }
   const p = parsePayload(r);
   if (!p.ok) {
     const msg = p.message ?? JSON.stringify(p.data)?.slice(0, 300) ?? "tool error";
-    throw new CommerceError(classifyFailure(undefined, msg), `${name}: ${msg}`, { raw: p.raw });
+    throw new CommerceError(classifyFailure(undefined, msg), `${name}: ${msg}`, { raw: p.raw, source: "payload" });
   }
   return p;
 }
@@ -282,10 +284,12 @@ export class SwiggyProvider implements CommerceProvider {
       for (const o of (d?.orders ?? []) as any[]) if (o?.orderId) orderIds.push(String(o.orderId));
       return { kind: "placed", orderIds: [...new Set(orderIds)], message: p.message, raw: p.raw };
     } catch (e) {
-      const err = e instanceof CommerceError ? e : new CommerceError("UNKNOWN", String((e as Error)?.message ?? e));
-      // Definite pre-acceptance failures: auth rejected, 400-class tool errors, payment declined
-      // with an explicit failure payload. Anything ambiguous (timeout, 5xx, parse) is UNKNOWN.
-      if (["AUTH", "SESSION_419", "MIN_ORDER", "UNSERVICEABLE", "CART_EXPIRED", "OOS", "PAYMENT_DECLINED", "CONFIG"].includes(err.code)) {
+      const err = e instanceof CommerceError ? e : new CommerceError("UNKNOWN", String((e as Error)?.message ?? e), { source: "transport" });
+      // Definite = provably not placed: nothing was sent, Swiggy answered with a failure payload
+      // (HTTP 200, success:false), or the HTTP layer rejected the request outright (4xx).
+      // Everything else — timeout, 5xx, connection drop, parse error — is UNKNOWN and must be reconciled.
+      const rejected4xx = err.source === "transport" && err.status !== undefined && err.status >= 400 && err.status < 500;
+      if (err.source === "pre-send" || err.source === "payload" || rejected4xx) {
         return { kind: "failed_definite", message: err.message, code: err.code, raw: err.raw };
       }
       return { kind: "unknown", message: err.message, raw: err.raw };

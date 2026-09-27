@@ -67,10 +67,14 @@ export interface Store {
 
   createDraft(d: { deviceId: string; state: DraftState; transcript?: string; items?: VoiceItem[] }): Promise<Draft>;
   getDraft(id: string): Promise<Draft | null>;
-  /** Non-state field updates (matched/cart/totals). Never changes `state`. */
-  updateDraftFields(id: string, patch: Partial<Omit<DraftPatch, "state">>): Promise<Draft | null>;
+  /**
+   * Non-state field updates (matched/error/meta). Never changes `state`.
+   * `ifState` makes the write conditional so a late request cannot clobber an approved snapshot.
+   */
+  updateDraftFields(id: string, patch: Partial<Omit<DraftPatch, "state">>, ifState?: DraftState[]): Promise<Draft | null>;
   /** The ONLY way to change draft state: single conditional UPDATE ... RETURNING. */
   casDraft(id: string, from: DraftState[], patch: Partial<DraftPatch> & { state: DraftState }): Promise<Draft | null>;
+  listDraftsByState(states: DraftState[], limit?: number): Promise<Draft[]>;
   supersedeActiveDrafts(deviceId: string, exceptId: string): Promise<void>;
   countDraftsSince(deviceId: string, since: Date): Promise<number>;
   expireStaleDrafts(olderThan: Date): Promise<number>;
@@ -84,8 +88,16 @@ export interface Store {
   spendSince(since: Date): Promise<{ totalPaise: number; count: number; codCount: number }>;
   anyBlockingOrder(): Promise<boolean>;
   unknownOrders(): Promise<OrderRow[]>;
+  /** A 'placing' row older than `olderThan` means the function died mid-checkout → treat as unknown. */
+  markStalePlacingUnknown(olderThan: Date): Promise<OrderRow[]>;
 
-  acquireLock(draftId: string, ttlMs: number): Promise<boolean>;
+  /**
+   * Global cart lease. holder 'cart' = list editing (re-entrant for the same draft);
+   * holder 'checkout' = exclusive: it may take over the draft's cart lease, but a cart edit
+   * can never take over a checkout lease.
+   */
+  acquireLock(draftId: string, ttlMs: number, holder: LockHolder): Promise<boolean>;
+  lockHeldBy(draftId: string, holder: LockHolder): Promise<boolean>;
   releaseLock(draftId: string): Promise<void>;
 
   /** true = first time seeing this update_id (process it); false = duplicate (skip). */
@@ -99,6 +111,8 @@ export interface Store {
 }
 
 type KVEnvelope = { v: unknown; exp?: number };
+
+export type LockHolder = "cart" | "checkout";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Drizzle / Neon implementation
@@ -140,6 +154,8 @@ function rowToOrder(r: typeof t.orders.$inferSelect): OrderRow {
 }
 
 const ACTIVE_PRECONFIRM: DraftState[] = ["recorded", "parsed", "matched", "cart_synced", "awaiting_confirm"];
+/** States a stale draft may be expired from. An old 'approved' draft must never auto-fire hours later. */
+const EXPIRABLE: DraftState[] = [...ACTIVE_PRECONFIRM, "awaiting_approval", "approved", "approved_waiting_login"];
 const BLOCKING_ORDER_STATES: OrderState[] = ["placing", "unknown"];
 const SPEND_ORDER_STATES: OrderState[] = ["placing", "placed", "partially_placed", "unknown"];
 
@@ -262,13 +278,18 @@ class DrizzleStore implements Store {
     return rows[0] ? rowToDraft(rows[0]) : null;
   }
 
-  async updateDraftFields(id: string, patch: Partial<Omit<DraftPatch, "state">>): Promise<Draft | null> {
+  async updateDraftFields(id: string, patch: Partial<Omit<DraftPatch, "state">>, ifState?: DraftState[]): Promise<Draft | null> {
     const rows = await db()
       .update(t.drafts)
       .set({ ...patch, updatedAt: new Date() })
-      .where(eq(t.drafts.id, id))
+      .where(ifState ? and(eq(t.drafts.id, id), inArray(t.drafts.state, ifState)) : eq(t.drafts.id, id))
       .returning();
     return rows[0] ? rowToDraft(rows[0]) : null;
+  }
+
+  async listDraftsByState(states: DraftState[], limit = 50): Promise<Draft[]> {
+    const rows = await db().select().from(t.drafts).where(inArray(t.drafts.state, states)).orderBy(desc(t.drafts.updatedAt)).limit(limit);
+    return rows.map(rowToDraft);
   }
 
   async casDraft(id: string, from: DraftState[], patch: Partial<DraftPatch> & { state: DraftState }): Promise<Draft | null> {
@@ -299,7 +320,7 @@ class DrizzleStore implements Store {
     const rows = await db()
       .update(t.drafts)
       .set({ state: "expired", updatedAt: new Date() })
-      .where(and(inArray(t.drafts.state, [...ACTIVE_PRECONFIRM, "awaiting_approval"]), lt(t.drafts.updatedAt, olderThan)))
+      .where(and(inArray(t.drafts.state, EXPIRABLE), lt(t.drafts.updatedAt, olderThan)))
       .returning({ id: t.drafts.id });
     return rows.length;
   }
@@ -349,26 +370,49 @@ class DrizzleStore implements Store {
     return rows.map(rowToOrder);
   }
 
-  async acquireLock(draftId: string, ttlMs: number): Promise<boolean> {
+  async markStalePlacingUnknown(olderThan: Date): Promise<OrderRow[]> {
+    const rows = await db()
+      .update(t.orders)
+      .set({ state: "unknown", updatedAt: new Date(), raw: { stalePlacing: true } })
+      .where(and(eq(t.orders.state, "placing"), lt(t.orders.createdAt, olderThan)))
+      .returning();
+    return rows.map(rowToOrder);
+  }
+
+  async acquireLock(draftId: string, ttlMs: number, holder: LockHolder): Promise<boolean> {
     await this.seed();
     const cutoff = new Date(Date.now() - ttlMs);
+    // free / expired → anyone; same draft → same holder may re-enter, and 'checkout' may take over 'cart'
+    const sameDraftOk =
+      holder === "checkout"
+        ? sql`${t.commerceLock.draftId} = ${draftId}`
+        : sql`(${t.commerceLock.draftId} = ${draftId} AND ${t.commerceLock.holder} IS DISTINCT FROM 'checkout')`;
     const rows = await db()
       .update(t.commerceLock)
-      .set({ draftId, acquiredAt: new Date() })
+      .set({ draftId, holder, acquiredAt: new Date() })
       .where(
         and(
           eq(t.commerceLock.id, 1),
-          sql`(${t.commerceLock.draftId} IS NULL OR ${t.commerceLock.draftId} = ${draftId} OR ${t.commerceLock.acquiredAt} < ${cutoff})`,
+          sql`(${t.commerceLock.draftId} IS NULL OR ${t.commerceLock.acquiredAt} < ${cutoff} OR ${sameDraftOk})`,
         ),
       )
       .returning();
     return rows.length > 0;
   }
 
+  async lockHeldBy(draftId: string, holder: LockHolder): Promise<boolean> {
+    const rows = await db()
+      .select({ id: t.commerceLock.id })
+      .from(t.commerceLock)
+      .where(and(eq(t.commerceLock.id, 1), eq(t.commerceLock.draftId, draftId), eq(t.commerceLock.holder, holder)))
+      .limit(1);
+    return rows.length > 0;
+  }
+
   async releaseLock(draftId: string): Promise<void> {
     await db()
       .update(t.commerceLock)
-      .set({ draftId: null, acquiredAt: null })
+      .set({ draftId: null, holder: null, acquiredAt: null })
       .where(and(eq(t.commerceLock.id, 1), eq(t.commerceLock.draftId, draftId)));
   }
 
@@ -420,7 +464,7 @@ type MemState = {
   drafts: Map<string, Draft>;
   orders: Map<string, OrderRow>;
   orderKeys: Set<string>;
-  lock: { draftId: string | null; acquiredAt: number | null };
+  lock: { draftId: string | null; holder: LockHolder | null; acquiredAt: number | null };
   processed: Set<number>;
   audits: { kind: string; deviceId?: string; draftId?: string; at: number; data?: unknown }[];
   pantry: Map<string, unknown>;
@@ -439,7 +483,7 @@ export class MemoryStore implements Store {
       drafts: new Map(),
       orders: new Map(),
       orderKeys: new Set(),
-      lock: { draftId: null, acquiredAt: null },
+      lock: { draftId: null, holder: null, acquiredAt: null },
       processed: new Set(),
       audits: [],
       pantry: new Map(),
@@ -558,11 +602,18 @@ export class MemoryStore implements Store {
   async getDraft(id: string): Promise<Draft | null> {
     return this.s.drafts.get(id) ?? null;
   }
-  async updateDraftFields(id: string, patch: Partial<Omit<DraftPatch, "state">>): Promise<Draft | null> {
+  async updateDraftFields(id: string, patch: Partial<Omit<DraftPatch, "state">>, ifState?: DraftState[]): Promise<Draft | null> {
     const d = this.s.drafts.get(id);
     if (!d) return null;
+    if (ifState && !ifState.includes(d.state)) return null;
     Object.assign(d, patch, { updatedAt: new Date() });
     return d;
+  }
+  async listDraftsByState(states: DraftState[], limit = 50): Promise<Draft[]> {
+    return [...this.s.drafts.values()]
+      .filter((d) => states.includes(d.state))
+      .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
+      .slice(0, limit);
   }
   async casDraft(id: string, from: DraftState[], patch: Partial<DraftPatch> & { state: DraftState }): Promise<Draft | null> {
     const d = this.s.drafts.get(id);
@@ -582,7 +633,7 @@ export class MemoryStore implements Store {
   async expireStaleDrafts(olderThan: Date): Promise<number> {
     let n = 0;
     for (const d of this.s.drafts.values())
-      if ([...ACTIVE_PRECONFIRM, "awaiting_approval"].includes(d.state) && d.updatedAt < olderThan) {
+      if (EXPIRABLE.includes(d.state) && d.updatedAt < olderThan) {
         d.state = "expired";
         n++;
       }
@@ -627,19 +678,34 @@ export class MemoryStore implements Store {
   async unknownOrders(): Promise<OrderRow[]> {
     return [...this.s.orders.values()].filter((o) => o.state === "unknown");
   }
+  async markStalePlacingUnknown(olderThan: Date): Promise<OrderRow[]> {
+    const out: OrderRow[] = [];
+    for (const o of this.s.orders.values())
+      if (o.state === "placing" && o.createdAt < olderThan) {
+        o.state = "unknown";
+        o.raw = { stalePlacing: true };
+        out.push(o);
+      }
+    return out;
+  }
 
-  async acquireLock(draftId: string, ttlMs: number): Promise<boolean> {
+  async acquireLock(draftId: string, ttlMs: number, holder: LockHolder): Promise<boolean> {
     const l = this.s.lock;
     const expired = l.acquiredAt !== null && l.acquiredAt < Date.now() - ttlMs;
-    if (l.draftId === null || l.draftId === draftId || expired) {
+    const sameDraftOk = l.draftId === draftId && (holder === "checkout" || l.holder !== "checkout");
+    if (l.draftId === null || expired || sameDraftOk) {
       l.draftId = draftId;
+      l.holder = holder;
       l.acquiredAt = Date.now();
       return true;
     }
     return false;
   }
+  async lockHeldBy(draftId: string, holder: LockHolder): Promise<boolean> {
+    return this.s.lock.draftId === draftId && this.s.lock.holder === holder;
+  }
   async releaseLock(draftId: string): Promise<void> {
-    if (this.s.lock.draftId === draftId) this.s.lock = { draftId: null, acquiredAt: null };
+    if (this.s.lock.draftId === draftId) this.s.lock = { draftId: null, holder: null, acquiredAt: null };
   }
 
   async markUpdateProcessed(updateId: number): Promise<boolean> {

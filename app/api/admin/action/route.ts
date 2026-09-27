@@ -9,11 +9,12 @@ import { createPairingCode } from "@/lib/auth/device";
 import { isOwnerRequest } from "@/lib/auth/owner";
 import { env } from "@/lib/env";
 import { makeCallbackData, sendOwner } from "@/lib/notify/telegram";
-import { resolveUnknown, setFlag } from "@/lib/orders/engine";
+import { runCheckout } from "@/lib/orders/checkout";
+import { resolveUnknown, retryApprovedDrafts, setFlag } from "@/lib/orders/engine";
 import { getStore } from "@/lib/store";
 
 const zBody = z.object({
-  action: z.enum(["pause", "resume", "dryrun_on", "dryrun_off", "pair_code", "revoke_device", "unlock_device", "resolve", "test_telegram"]),
+  action: z.enum(["pause", "resume", "dryrun_on", "dryrun_off", "pair_code", "revoke_device", "unlock_device", "resolve", "test_telegram", "clear_swiggy_login"]),
   deviceId: z.string().optional(),
   name: z.string().max(40).optional(),
   orderId: z.string().optional(),
@@ -42,6 +43,7 @@ export async function POST(req: NextRequest) {
     case "resume":
       if (await confirmViaTelegram("paused", false, "resume ordering")) return json({ ok: true, pending: "confirm on Telegram" });
       await setFlag("paused", false);
+      await retryApprovedDrafts(runCheckout);
       return json({ ok: true });
     case "dryrun_on":
       await setFlag("dryRun", true);
@@ -68,9 +70,16 @@ export async function POST(req: NextRequest) {
     case "resolve":
       if (!a.orderId || a.placed === undefined) return json({ error: "orderId and placed required" }, 400);
       await resolveUnknown(a.orderId, a.placed);
+      await retryApprovedDrafts(runCheckout);
       return json({ ok: true });
     case "test_telegram":
       await sendOwner("👋 Rasoi test message — the bot works.");
       return json({ ok: env.telegramConfigured, configured: env.telegramConfigured });
+    case "clear_swiggy_login":
+      // incident runbook step 2: without a token no order can be placed
+      await store.clearSwiggyAuth();
+      await store.audit("swiggy_login_cleared");
+      await sendOwner("🔒 Swiggy login was deleted from /admin. No orders can be placed until /login.");
+      return json({ ok: true });
   }
 }

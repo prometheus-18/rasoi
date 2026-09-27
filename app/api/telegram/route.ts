@@ -9,7 +9,7 @@ import { timingSafeEqualStr } from "@/lib/crypto";
 import { env } from "@/lib/env";
 import { answerCallback, consumeCallbackData, editOwnerMessage, makeCallbackData, sendChat, sendOwner } from "@/lib/notify/telegram";
 import { runCheckout } from "@/lib/orders/checkout";
-import { approveDraft, getFlags, getLimits, rejectDraft, resolveUnknown, resumeWaitingDrafts, setFlag, spendContext } from "@/lib/orders/engine";
+import { approveDraft, getFlags, getLimits, rejectDraft, resolveUnknown, resumeWaitingDrafts, retryApprovedDrafts, setFlag, spendContext } from "@/lib/orders/engine";
 import { createPairingCode } from "@/lib/auth/device";
 import { getStore } from "@/lib/store";
 import { rupeesText } from "@/lib/types";
@@ -79,12 +79,14 @@ async function handleCallback(cq: any): Promise<void> {
       await setFlag(action.key as "paused" | "dryRun", Boolean(action.value));
       if (messageId) await editOwnerMessage(messageId, `${baseText}\n\n✓ done`);
       if (action.key === "dryRun" && action.value === false) await sendOwner("🔴 DRY RUN is OFF — orders are REAL now (in Production).");
+      if (action.key === "paused" && action.value === false) await retryApprovedDrafts(runCheckout);
       return;
     }
     case "resolve_placed":
     case "resolve_not_placed": {
       await resolveUnknown(action.key!, action.action === "resolve_placed");
       if (messageId) await editOwnerMessage(messageId, `${baseText}\n\n✓ marked ${action.action === "resolve_placed" ? "PLACED" : "NOT placed"}`);
+      await retryApprovedDrafts(runCheckout); // anything that was waiting behind the unknown order
       return;
     }
     case "unlock_device": {
@@ -120,6 +122,7 @@ async function handleMessage(msg: any): Promise<void> {
       const { expiresAt } = await completeSwiggyPaste(text);
       await reply(`🔓 Swiggy login OK. Valid until ${expiresAt.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST.`);
       const resumed = await resumeWaitingDrafts(runCheckout);
+      await retryApprovedDrafts(runCheckout);
       if (resumed > 0) await reply(`▶️ ${resumed} waiting order(s) resumed.`);
     } catch (e) {
       await reply(`Login paste failed: ${String((e as Error).message)}. Tap the /login link and paste again within 2 minutes.`);
@@ -139,10 +142,13 @@ async function handleMessage(msg: any): Promise<void> {
       await setFlag("paused", true);
       await reply("⏸️ Paused. No orders can be placed until /resume.");
       return;
-    case "/resume":
+    case "/resume": {
       await setFlag("paused", false);
       await reply("▶️ Resumed. Ordering is allowed again.");
+      const n = await retryApprovedDrafts(runCheckout);
+      if (n) await reply(`▶️ ${n} approved order(s) that were waiting are being placed now.`);
       return;
+    }
     case "/dryrun": {
       const arg = text.split(/\s+/)[1]?.toLowerCase();
       const flags = await getFlags();

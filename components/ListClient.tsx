@@ -2,6 +2,9 @@
 
 // S3: the priced list. Photos, Hindi names, − qty + steppers, "?" candidate picks,
 // नहीं-मिला rows, live total, real payment method, confirm sheet (hold 1.5 s + 15 s undo).
+// Safety details: every timer is cleared on unmount (an undo countdown must NEVER fire after the
+// cook navigated away), cart syncs are sequence-numbered (a slow old response can't overwrite a
+// newer cart), and a pending sync is flushed before the confirm sheet shows a total.
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -42,13 +45,21 @@ type Status = {
   cart?: Cart | null;
   reasons?: string[];
   dry?: boolean;
+  updatedAt?: string;
 };
 
 type Line = { spinId: string; skuId: string; quantity: number };
-type Phase = "loading" | "ready" | "sheet" | "countdown" | "waiting" | "failed";
+type Phase = "loading" | "ready" | "sheet" | "countdown" | "waiting" | "failed" | "forwarded";
 
-const ru = (p?: number | null) => `₹${Math.round((p ?? 0) / 100)}`;
+const MIN_ORDER_PAISE = 9900;
 const TERMINAL = ["placed", "partially_placed", "not_placed", "unknown", "rejected", "expired", "superseded"];
+const WAITING = ["awaiting_approval", "approved", "approved_waiting_login", "placing_swiggypay", "placing_cod"];
+
+/** ₹ with paise only when they exist (cash amounts must be exact). */
+const ru = (p?: number | null) => {
+  const r = (p ?? 0) / 100;
+  return `₹${Number.isInteger(r) ? r : r.toFixed(2)}`;
+};
 
 export function ListClient({ draftId }: { draftId: string }) {
   const router = useRouter();
@@ -57,35 +68,56 @@ export function ListClient({ draftId }: { draftId: string }) {
   const [cart, setCart] = useState<Cart | null>(null);
   const [phase, setPhase] = useState<Phase>("loading");
   const [waitingHi, setWaitingHi] = useState("मालिक से पूछ रहे हैं…");
+  const [waitingState, setWaitingState] = useState("");
+  const [waitingSince, setWaitingSince] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [syncing, setSyncing] = useState(false);
+  const [inFlight, setInFlight] = useState(0);
   const [pinNeeded, setPinNeeded] = useState(false);
   const [countdown, setCountdown] = useState(15);
   const [payment, setPayment] = useState<"SWIGGY_MONEY" | "COD">("SWIGGY_MONEY");
   const syncTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const countdownTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const seq = useRef(0); // monotonically increasing cart-sync id; stale responses are ignored
   const linesRef = useRef(lines);
   linesRef.current = lines;
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      if (syncTimer.current) clearTimeout(syncTimer.current);
+    };
+  }, []);
 
   const syncCart = useCallback(
-    async (ls: Record<string, Line>) => {
+    async (ls: Record<string, Line>): Promise<Cart | null> => {
       const list = Object.values(ls).filter((l) => l.quantity > 0);
       if (!list.length) {
         setCart(null);
-        return;
+        return null;
       }
-      setSyncing(true);
+      const mySeq = ++seq.current;
+      setInFlight((n) => n + 1);
       try {
         const res = await api<{ cart: Cart; paymentMethod: "SWIGGY_MONEY" | "COD" }>(`/api/draft/${draftId}/cart`, {
           method: "POST",
           body: JSON.stringify({ lines: list }),
         });
+        if (!mounted.current || mySeq !== seq.current) return null; // a newer sync superseded this one
         setCart(res.cart);
         setPayment(res.paymentMethod);
+        return res.cart;
       } catch (e) {
+        if (!mounted.current || mySeq !== seq.current) return null;
+        if (e instanceof ApiError && e.data?.state === "changed") {
+          setPhase("waiting");
+          setWaitingHi("लिस्ट पक्की हो चुकी है…");
+          return null;
+        }
         setError(e instanceof ApiError ? (e.data?.hi ?? "दुकान से जवाब नहीं मिला") : "इंटरनेट नहीं चल रहा");
+        return null;
       } finally {
-        setSyncing(false);
+        if (mounted.current) setInFlight((n) => Math.max(0, n - 1));
       }
     },
     [draftId],
@@ -96,14 +128,21 @@ export function ListClient({ draftId }: { draftId: string }) {
     let dead = false;
     (async () => {
       try {
-        let s = await api<Status>(`/api/draft/${draftId}/status`);
+        const s = await api<Status>(`/api/draft/${draftId}/status`);
+        if (dead) return;
         if (TERMINAL.includes(s.state)) {
           router.replace(`/status/${draftId}`);
           return;
         }
-        if (["awaiting_approval", "approved", "approved_waiting_login", "placing_swiggypay", "placing_cod"].includes(s.state)) {
+        if (WAITING.includes(s.state)) {
           setPhase("waiting");
           setWaitingHi(s.stateHi);
+          setWaitingState(s.state);
+          setWaitingSince(Date.now());
+          return;
+        }
+        if (s.error === "login_needed" || s.error === "swiggy_down") {
+          setPhase("forwarded");
           return;
         }
         let m = s.matched ?? null;
@@ -126,6 +165,11 @@ export function ListClient({ draftId }: { draftId: string }) {
         void speakHi(found ? "लिस्ट तैयार है" : "कुछ नहीं मिला — फिर से बोलें");
       } catch (e) {
         if (dead) return;
+        if (e instanceof ApiError && (e.data?.error === "login_needed" || e.data?.error === "swiggy_down")) {
+          setPhase("forwarded");
+          void speakHi("मालिक को भेज दिया");
+          return;
+        }
         setError(e instanceof ApiError ? (e.data?.hi ?? "कुछ गड़बड़ हुई") : "इंटरनेट नहीं चल रहा");
         setPhase("failed");
       }
@@ -141,7 +185,9 @@ export function ListClient({ draftId }: { draftId: string }) {
     const t = setInterval(async () => {
       try {
         const s = await api<Status>(`/api/draft/${draftId}/status`);
+        if (!mounted.current) return;
         setWaitingHi(s.stateHi);
+        setWaitingState(s.state);
         if (TERMINAL.includes(s.state)) {
           clearInterval(t);
           router.replace(`/status/${draftId}`);
@@ -151,10 +197,34 @@ export function ListClient({ draftId }: { draftId: string }) {
     return () => clearInterval(t);
   }, [phase, draftId, router]);
 
+  // undo countdown: lives in an effect so unmount/cancel always clears it, and confirm() runs
+  // as a normal effect side-effect, never inside a state updater
+  useEffect(() => {
+    if (phase !== "countdown") return;
+    if (countdown <= 0) {
+      void confirm();
+      return;
+    }
+    const t = setTimeout(() => setCountdown((c) => c - 1), 1000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, countdown]);
+
   function queueSync(next: Record<string, Line>) {
     setLines(next);
     if (syncTimer.current) clearTimeout(syncTimer.current);
     syncTimer.current = setTimeout(() => void syncCart(linesRef.current), 800);
+  }
+
+  /** Flush any pending debounced edit and wait for the freshest cart before showing a total. */
+  async function flushSync(): Promise<Cart | null> {
+    if (syncTimer.current) {
+      clearTimeout(syncTimer.current);
+      syncTimer.current = null;
+      return await syncCart(linesRef.current);
+    }
+    if (inFlight > 0) return await syncCart(linesRef.current);
+    return cart;
   }
 
   function bump(item: Matched, delta: number) {
@@ -169,14 +239,26 @@ export function ListClient({ draftId }: { draftId: string }) {
     queueSync({ ...lines, [item.key]: { spinId: c.variant.spinId, skuId: c.variant.skuId, quantity: item.quantity || 1 } });
   }
 
+  async function openSheet() {
+    setError(null);
+    const fresh = await flushSync();
+    if (!mounted.current) return;
+    if (!fresh || fresh.items.length === 0) return;
+    setPhase("sheet");
+  }
+
   async function confirm() {
     setPhase("waiting");
     setWaitingHi("भेज रहे हैं…");
+    setWaitingSince(Date.now());
     try {
       const res = await api<{ status: string; hi?: string }>(`/api/draft/${draftId}/confirm`, { method: "POST", body: "{}" });
+      if (!mounted.current) return;
       setWaitingHi(res.hi ?? "…");
+      setWaitingState(res.status === "placing" ? "approved" : "awaiting_approval");
       void speakHi(res.hi ?? "");
     } catch (e) {
+      if (!mounted.current) return;
       if (e instanceof ApiError && e.data?.error === "pin_required") {
         setPinNeeded(true);
         setPhase("ready");
@@ -196,25 +278,13 @@ export function ListClient({ draftId }: { draftId: string }) {
     }
   }
 
-  function startCountdown() {
-    setPhase("countdown");
-    setCountdown(15);
-    countdownTimer.current = setInterval(() => {
-      setCountdown((c) => {
-        if (c <= 1) {
-          if (countdownTimer.current) clearInterval(countdownTimer.current);
-          void confirm();
-          return 0;
-        }
-        return c - 1;
-      });
-    }, 1000);
-  }
-
-  function cancelCountdown() {
-    if (countdownTimer.current) clearInterval(countdownTimer.current);
-    setPhase("ready");
-    void speakHi("रोक दिया");
+  async function retryCheckout() {
+    try {
+      await api(`/api/draft/${draftId}/checkout`, { method: "POST", body: "{}" });
+      setWaitingSince(Date.now());
+    } catch (e) {
+      if (e instanceof ApiError && e.data?.error === "pin_required") setPinNeeded(true);
+    }
   }
 
   const priceOf = (item: Matched): number => {
@@ -233,14 +303,33 @@ export function ListClient({ draftId }: { draftId: string }) {
       </Center>
     );
 
-  if (phase === "waiting")
+  if (phase === "forwarded")
+    return (
+      <Center>
+        <div className="text-6xl">📨</div>
+        <p className="px-6 text-center text-3xl font-extrabold">मालिक को भेज दिया ✓</p>
+        <p className="px-8 text-center text-xl text-faint">दुकान से अभी जवाब नहीं आया — मालिक लिस्ट देखकर मंगा देंगे।</p>
+        <Link href="/" className="flex h-16 w-full items-center justify-center rounded-2xl bg-brand text-2xl font-extrabold text-white">
+          🏠 वापस
+        </Link>
+      </Center>
+    );
+
+  if (phase === "waiting") {
+    const stuckApproved = waitingState === "approved" && Date.now() - waitingSince > 20_000;
     return (
       <Center>
         <div className="text-6xl animate-bob">🙏</div>
         <p className="px-8 text-center text-3xl font-extrabold">{waitingHi}</p>
         <p className="text-lg text-faint">यह पेज खुला रखें</p>
+        {stuckApproved && (
+          <button type="button" onClick={() => void retryCheckout()} className="h-16 w-full rounded-2xl bg-brand text-2xl font-extrabold text-white">
+            ↻ फिर कोशिश करें
+          </button>
+        )}
       </Center>
     );
+  }
 
   if (phase === "failed")
     return (
@@ -254,14 +343,16 @@ export function ListClient({ draftId }: { draftId: string }) {
     );
 
   const total = cart?.toPayPaise ?? 0;
+  const itemTotal = cart?.itemTotalPaise ?? cart?.items.reduce((s, i) => s + i.linePaise, 0) ?? 0;
   const anyItems = Object.values(lines).some((l) => l.quantity > 0);
-  const minOrder = cart?.warnings.some((w) => /99|minimum/i.test(w));
+  const minOrderShort = anyItems && itemTotal > 0 && itemTotal < MIN_ORDER_PAISE;
   const swiggyMoney = cart?.paymentOptions?.swiggyMoney?.available;
+  const syncing = inFlight > 0;
 
   return (
     <main className="mx-auto flex min-h-dvh max-w-md flex-col pb-44">
-      <header className="sticky top-0 z-20 flex items-center justify-between bg-bg/95 px-5 py-3 backdrop-blur">
-        <Link href="/" className="text-xl font-bold text-faint">
+      <header className="sticky top-0 z-20 flex items-center justify-between bg-bg/95 px-3 py-2 backdrop-blur">
+        <Link href="/" className="flex h-12 items-center rounded-xl px-3 text-xl font-bold text-faint active:bg-line">
           ← वापस
         </Link>
         <h1 className="text-2xl font-extrabold">आपकी लिस्ट</h1>
@@ -270,7 +361,7 @@ export function ListClient({ draftId }: { draftId: string }) {
         </button>
       </header>
 
-      {error && phase === "ready" && (
+      {error && (
         <button type="button" onClick={() => setError(null)} className="mx-5 mt-1 rounded-2xl bg-warn-bg px-4 py-3 text-lg font-bold text-warn">
           ⚠ {error}
         </button>
@@ -343,19 +434,17 @@ export function ListClient({ draftId }: { draftId: string }) {
             {swiggyMoney ? "💳 Swiggy Money" : `💵 ${ru(total)} नकद देना है`}
             {cart && cart.storeCount > 1 ? ` · 🏪 ${cart.storeCount} दुकान` : ""}
           </span>
-          <span className="text-3xl font-extrabold">
-            {syncing ? <span className="text-faint">…</span> : ru(total)}
-          </span>
+          <span className="text-3xl font-extrabold">{syncing ? <span className="text-faint">…</span> : ru(total)}</span>
         </div>
-        {minOrder && <p className="mb-2 text-center text-base font-bold text-warn">₹99 से कम — और सामान जोड़ें</p>}
+        {minOrderShort && <p className="mb-2 text-center text-base font-bold text-warn">₹99 से कम — और सामान जोड़ें</p>}
         <div className="flex gap-3">
           <Link href="/" className="flex h-16 flex-1 items-center justify-center rounded-2xl border-2 border-brand text-xl font-extrabold text-brand">
             🎤 और बोलें
           </Link>
           <button
             type="button"
-            disabled={!anyItems || syncing || Boolean(minOrder)}
-            onClick={() => setPhase("sheet")}
+            disabled={!anyItems || syncing || minOrderShort}
+            onClick={() => void openSheet()}
             className="h-16 flex-[1.4] rounded-2xl bg-go text-2xl font-extrabold text-white shadow-lg disabled:opacity-40"
           >
             ✅ ऑर्डर करो →
@@ -378,15 +467,28 @@ export function ListClient({ draftId }: { draftId: string }) {
             <p className="mb-4 text-center text-lg font-semibold text-faint">{swiggyMoney ? "💳 Swiggy Money से कटेंगे" : "💵 डिलीवरी पर नकद देना है"}</p>
             {phase === "sheet" ? (
               <>
-                <HoldConfirm label={`✅ ${ru(total)} — दबाए रखें`} onConfirmed={startCountdown} />
-                <button type="button" onClick={() => setPhase("ready")} className="mt-3 w-full rounded-2xl py-3 text-xl font-bold text-faint">
+                <HoldConfirm
+                  label={`✅ ${ru(total)} — दबाए रखें`}
+                  onConfirmed={() => {
+                    setCountdown(15);
+                    setPhase("countdown");
+                  }}
+                />
+                <button type="button" onClick={() => setPhase("ready")} className="mt-3 h-14 w-full rounded-2xl text-xl font-bold text-faint">
                   वापस
                 </button>
               </>
             ) : (
               <>
                 <p className="text-center text-xl font-bold">{countdown} सेकंड में ऑर्डर होगा…</p>
-                <button type="button" onClick={cancelCountdown} className="mt-3 h-16 w-full rounded-2xl bg-danger text-2xl font-extrabold text-white">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPhase("ready");
+                    void speakHi("रोक दिया");
+                  }}
+                  className="mt-3 h-16 w-full rounded-2xl bg-danger text-2xl font-extrabold text-white"
+                >
                   रद्द करें
                 </button>
               </>

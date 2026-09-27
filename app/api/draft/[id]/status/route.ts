@@ -33,21 +33,23 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
   const { draft } = auth;
 
   // Live tracking for placed real orders, server-cached for 45 s.
-  let track: TrackInfo | null = null;
+  // Only status + ETA leave the server: the raw track_order payload carries the address/phone.
+  let track: { status?: string; etaMinutes?: number } | null = null;
   const orderIds = (draft.meta?.orderIds as string[] | undefined) ?? [];
   if (draft.state === "placed" && orderIds[0] && orderIds[0] !== "DRY-RUN") {
     const store = getStore();
     const key = `track:${orderIds[0]}`;
-    track = await store.getKV<TrackInfo>(key);
-    if (!track) {
+    let full = await store.getKV<TrackInfo>(key);
+    if (!full) {
       try {
         const provider = await getProvider();
-        track = await provider.trackOrder(orderIds[0]);
-        await store.setKV(key, track, 45_000);
+        full = await provider.trackOrder(orderIds[0]);
+        await store.setKV(key, full, 45_000);
       } catch {
-        track = null;
+        full = null;
       }
     }
+    if (full) track = { status: full.status, etaMinutes: full.etaMinutes };
   }
 
   return json({
@@ -65,6 +67,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string 
     swiggyMessage: (draft.meta?.swiggyMessage as string | undefined) ?? null,
     dry: Boolean(draft.meta?.dry),
     track,
+    version: draft.version,
     updatedAt: draft.updatedAt,
   });
 }

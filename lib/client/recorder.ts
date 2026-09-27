@@ -19,11 +19,22 @@ export class Recorder {
   onLevel?: (level: number) => void;
   private levelTimer: ReturnType<typeof setInterval> | null = null;
   private audioCtx: AudioContext | null = null;
+  private cancelled = false;
+
+  get active(): boolean {
+    return this.rec !== null && this.rec.state !== "inactive";
+  }
 
   async start(onStarted?: () => void): Promise<void> {
-    this.stream = await navigator.mediaDevices.getUserMedia({
+    const stream = await navigator.mediaDevices.getUserMedia({
       audio: { noiseSuppression: true, echoCancellation: true, channelCount: 1 },
     });
+    if (this.cancelled) {
+      // the finger was released (or the component unmounted) while the permission prompt was up
+      stream.getTracks().forEach((t) => t.stop());
+      throw new Error("cancelled");
+    }
+    this.stream = stream;
     const mimeType = pickMime();
     this.rec = new MediaRecorder(this.stream, { ...(mimeType ? { mimeType } : {}), audioBitsPerSecond: 32_000 });
     this.chunks = [];
@@ -81,7 +92,9 @@ export class Recorder {
     });
   }
 
+  /** Abort: stops everything, discards audio, and makes a pending start() release its stream. */
   cancel(): void {
+    this.cancelled = true;
     try {
       if (this.rec && this.rec.state !== "inactive") this.rec.stop();
     } catch {}

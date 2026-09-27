@@ -1,4 +1,4 @@
-// Order engine: flags, spend windows, the confirm → approval flow, and the reconciler.
+// Order engine: flags, spend windows, the confirm → approval flow, sweepers and the reconciler.
 // Every state change is a CAS (single conditional UPDATE) via the store.
 
 import { getProvider } from "@/lib/commerce/provider";
@@ -9,6 +9,10 @@ import { getStore } from "@/lib/store";
 import { rupeesText, type CartView, type Draft, type PaymentMethod } from "@/lib/types";
 
 export type Flags = { paused: boolean; dryRun: boolean };
+
+const MIN_ORDER_PAISE = 99_00;
+/** A 'placing' order row older than this means the function died mid-checkout. */
+export const STALE_PLACING_MS = 10 * 60_000;
 
 export async function getFlags(): Promise<Flags> {
   const f = await getStore().getKV<Partial<Flags>>("flags");
@@ -43,7 +47,10 @@ export async function markOrderedNames(names: string[]): Promise<void> {
   await getStore().setKV("ordered_names", [...cur]);
 }
 
-export async function spendContext(now: Date): Promise<{ spentDayPaise: number; spentWeekPaise: number; ordersToday: number; codOrdersToday: number }> {
+export type SpendContext = { spentDayPaise: number; spentWeekPaise: number; ordersToday: number; codOrdersToday: number };
+
+/** Conservative spend: placing + placed + partially_placed + unknown order rows all count. */
+export async function spendContext(now: Date): Promise<SpendContext> {
   const store = getStore();
   const day = await store.spendSince(istDayStart(now));
   const week = await store.spendSince(istWeekStart(now));
@@ -66,7 +73,7 @@ export type ConfirmOutcome =
   | { status: "paused" }
   | { status: "blocked" }
   | { status: "resync"; cart: CartView }
-  | { status: "invalid"; error: string };
+  | { status: "invalid"; error: string; hi?: string };
 
 /**
  * Called when the cook completes hold-to-confirm (+ undo countdown) on a cart_synced draft.
@@ -75,7 +82,7 @@ export type ConfirmOutcome =
 export async function confirmDraft(draft: Draft): Promise<ConfirmOutcome> {
   const store = getStore();
   if (draft.state !== "cart_synced") return { status: "invalid", error: `state ${draft.state}` };
-  if (!draft.cart || draft.cart.items.length === 0) return { status: "invalid", error: "empty cart" };
+  if (!draft.cart || draft.cart.items.length === 0) return { status: "invalid", error: "empty cart", hi: "कुछ भी चुना नहीं है" };
 
   const flags = await getFlags();
   if (flags.paused) return { status: "paused" };
@@ -92,7 +99,8 @@ export async function confirmDraft(draft: Draft): Promise<ConfirmOutcome> {
         fresh.items.length !== cart.items.length ||
         fresh.items.some((fi) => !cart.items.find((ci) => ci.spinId === fi.spinId && ci.quantity === fi.quantity));
       if (itemsChanged || drift > Math.max(1000, cart.toPayPaise * 0.03)) {
-        await store.updateDraftFields(draft.id, { cart: fresh, totalPaise: fresh.toPayPaise });
+        // conditional write: only while still cart_synced, so nothing post-approval is ever clobbered
+        await store.updateDraftFields(draft.id, { cart: fresh, totalPaise: fresh.toPayPaise }, ["cart_synced"]);
         return { status: "resync", cart: fresh };
       }
       cart = fresh;
@@ -100,6 +108,10 @@ export async function confirmDraft(draft: Draft): Promise<ConfirmOutcome> {
   } catch {
     // cart read failed — keep the stored snapshot; the checkout pre-flight re-verifies anyway
   }
+
+  const itemTotal = cart.itemTotalPaise ?? cart.items.reduce((s, i) => s + i.linePaise, 0);
+  if (itemTotal < MIN_ORDER_PAISE) return { status: "invalid", error: "below_min_order", hi: "₹99 से कम — और सामान जोड़ें" };
+  if (cart.toPayPaise <= 0) return { status: "invalid", error: "zero_total", hi: "दाम नहीं मिला — फिर कोशिश करें" };
 
   const method: PaymentMethod = draft.paymentMethod ?? "SWIGGY_MONEY";
   const now = new Date();
@@ -189,34 +201,75 @@ export async function rejectDraft(draftId: string): Promise<boolean> {
   return Boolean(ok);
 }
 
-/** After a successful re-login: release any drafts that were approved while logged out. */
+/**
+ * After a successful re-login: release drafts that were approved while logged out.
+ * Query-based (no side list), so nothing can be lost between park and resume.
+ */
 export async function resumeWaitingDrafts(runCheckout: (draftId: string) => Promise<void>): Promise<number> {
   const store = getStore();
   let n = 0;
-  const waiting = (await store.getKV<string[]>("waiting_login_drafts")) ?? [];
-  for (const id of waiting) {
-    const ok = await store.casDraft(id, ["approved_waiting_login"], { state: "approved" });
-    if (ok) {
+  for (const d of await store.listDraftsByState(["approved_waiting_login"])) {
+    if (await store.casDraft(d.id, ["approved_waiting_login"], { state: "approved" })) {
       n++;
-      await runCheckout(id);
+      await runCheckout(d.id);
     }
   }
-  await store.deleteKV("waiting_login_drafts");
   return n;
 }
 
-export async function trackWaitingDraft(draftId: string): Promise<void> {
+/**
+ * Sweeper: any draft still 'approved' (paused at the time, blocked by an unknown order, lock
+ * contention, or a crash before the placing CAS) gets another runCheckout. Idempotent — the
+ * order key guarantees at most one real attempt. Called from /resume, /resolve, login and cron.
+ */
+export async function retryApprovedDrafts(runCheckout: (draftId: string) => Promise<void>): Promise<number> {
   const store = getStore();
-  const waiting = (await store.getKV<string[]>("waiting_login_drafts")) ?? [];
-  if (!waiting.includes(draftId)) await store.setKV("waiting_login_drafts", [...waiting, draftId]);
+  let n = 0;
+  for (const d of await store.listDraftsByState(["approved"])) {
+    n++;
+    await runCheckout(d.id);
+  }
+  return n;
 }
 
 /**
- * Reconcile unknown orders against get_orders: match by total (±₹1) and time window.
- * Runs after a checkout timeout and from cron. An unmatched unknown keeps blocking checkouts.
+ * Re-check ONLY the spend-window rules for a draft about to be placed. Item-level rules were
+ * already accepted at approval; but a concurrent order may have consumed the day/week budget
+ * since. `ownOrderPaise`/`ownIsCod` exclude the caller's own freshly inserted 'placing' row.
+ */
+export async function spendGuard(draft: Draft, ownOrderPaise: number, ownIsCod: boolean): Promise<PolicyReason[]> {
+  const now = new Date();
+  const [limits, spend, orderedBefore] = await Promise.all([getLimits(), spendContext(now), getOrderedNames()]);
+  const result = evaluatePolicy({
+    toPayPaise: ownOrderPaise,
+    paymentMethod: draft.paymentMethod ?? "SWIGGY_MONEY",
+    lines: policyLines(draft),
+    now,
+    spentDayPaise: Math.max(0, spend.spentDayPaise - ownOrderPaise),
+    spentWeekPaise: Math.max(0, spend.spentWeekPaise - ownOrderPaise),
+    ordersToday: Math.max(0, spend.ordersToday - 1),
+    codOrdersToday: Math.max(0, spend.codOrdersToday - (ownIsCod ? 1 : 0)),
+    orderedBefore,
+    limits: { ...limits, supervised: false },
+  });
+  const WINDOW_CODES = new Set(["OVER_DAY_LIMIT", "OVER_WEEK_LIMIT", "TOO_MANY_ORDERS", "COD_COUNT"]);
+  return result.reasons.filter((r) => WINDOW_CODES.has(r.code));
+}
+
+/**
+ * Reconcile unknown orders against get_orders. A match needs the same total (±₹1) AND a parseable
+ * timestamp inside the window — a total alone can match last week's order.
+ * Also converts crashed 'placing' rows into 'unknown' first so they become resolvable.
  */
 export async function reconcileUnknownOrders(): Promise<void> {
   const store = getStore();
+  const stale = await store.markStalePlacingUnknown(new Date(Date.now() - STALE_PLACING_MS));
+  for (const s of stale) {
+    await store.casDraft(s.draftId, ["placing_swiggypay", "placing_cod"], { state: "unknown", error: "ऑर्डर शायद हो गया — दोबारा मत करना" });
+    await store.audit("stale_placing_marked_unknown", { draftId: s.draftId });
+    await sendOwner(`⚠️ An order attempt (₹${rupeesText(s.totalPaise)}) never finished — marked UNKNOWN. New orders are blocked until /resolve.`);
+  }
+
   const unknowns = await store.unknownOrders();
   if (!unknowns.length) return;
   const provider = await getProvider();
@@ -231,11 +284,10 @@ export async function reconcileUnknownOrders(): Promise<void> {
     const from = u.createdAt.getTime() - 2 * 60_000;
     const to = u.createdAt.getTime() + 15 * 60_000;
     const match = providerOrders.find((o) => {
-      if (o.totalPaise === undefined) return false;
-      if (Math.abs(o.totalPaise - u.totalPaise) > 100) return false;
-      if (!o.createdAt) return true; // total matches, no timestamp — accept
+      if (o.totalPaise === undefined || Math.abs(o.totalPaise - u.totalPaise) > 100) return false;
+      if (!o.createdAt) return false;
       const ts = Date.parse(o.createdAt);
-      return Number.isNaN(ts) ? true : ts >= from && ts <= to;
+      return !Number.isNaN(ts) && ts >= from && ts <= to;
     });
     if (match) {
       await store.updateOrder(u.id, { state: "placed", swiggyOrderIds: [match.orderId], placedAt: new Date() });

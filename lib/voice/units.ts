@@ -66,15 +66,14 @@ export function itemWeightKg(item: VoiceItem): number | null {
   }
 }
 
-/** Count-based quantity for the per-item unit limit. */
+/** Count-based quantity for the per-item unit limit. A dozen is one pack, not 12 units. */
 export function itemUnitCount(item: VoiceItem): number | null {
   switch (item.unit) {
     case "pack":
     case "piece":
     case "bunch":
-      return item.qty;
     case "dozen":
-      return item.qty * 12;
+      return item.qty;
     default:
       return null;
   }

@@ -66,6 +66,7 @@ export const orders = pgTable("orders", {
 export const commerceLock = pgTable("commerce_lock", {
   id: integer("id").primaryKey(),
   draftId: uuid("draft_id"),
+  holder: text("holder"), // 'cart' (list editing lease) | 'checkout' (exclusive; cart edits refused)
   acquiredAt: timestamp("acquired_at", { withTimezone: true }),
 });
 

@@ -6,11 +6,11 @@ import { timingSafeEqualStr } from "@/lib/crypto";
 import { env } from "@/lib/env";
 import { createOwnerLink } from "@/lib/auth/owner";
 import { sendOwner } from "@/lib/notify/telegram";
-import { getLimits, reconcileUnknownOrders, spendContext } from "@/lib/orders/engine";
+import { runCheckout } from "@/lib/orders/checkout";
+import { getLimits, reconcileUnknownOrders, retryApprovedDrafts, spendContext } from "@/lib/orders/engine";
 import { getStore } from "@/lib/store";
-import { rupeesText } from "@/lib/types";
 
-export const maxDuration = 60;
+export const maxDuration = 300;
 
 function authorized(req: NextRequest): boolean {
   const header = req.headers.get("authorization") ?? "";
@@ -23,6 +23,7 @@ export async function GET(req: NextRequest) {
 
   const expired = await store.expireStaleDrafts(new Date(Date.now() - 2 * 3600_000));
   await reconcileUnknownOrders();
+  await retryApprovedDrafts(runCheckout);
 
   const login = await swiggyLoginStatus();
   if (!env.isDemo && (!login.loggedIn || (login.hoursLeft ?? 0) < 48)) {

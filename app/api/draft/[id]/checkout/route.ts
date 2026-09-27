@@ -4,6 +4,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { after } from "next/server";
 import { json, requireDraft } from "@/lib/api";
+import { pinCookieValid } from "@/lib/auth/pin";
 import { runCheckout } from "@/lib/orders/checkout";
 
 export const maxDuration = 300;
@@ -12,6 +13,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const { id } = await ctx.params;
   const auth = await requireDraft(req, id);
   if (auth instanceof NextResponse) return auth;
+  if (!pinCookieValid(req, auth.device)) return json({ error: "pin_required", hi: "पहले पिन डालें" }, 401);
   if (auth.draft.state !== "approved") return json({ error: "bad_state", state: auth.draft.state }, 409);
   after(() => runCheckout(id));
   return json({ status: "placing", hi: "ऑर्डर हो रहा है…" }, 202);
