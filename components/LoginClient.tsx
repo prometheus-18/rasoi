@@ -93,14 +93,18 @@ export function LoginClient() {
             Tap the address bar, <b>copy the whole URL</b> (it starts with <code>http://localhost/callback?code=</code>), paste it below and press Save — within 2 minutes.
           </li>
         </ol>
-        <a
-          href="/api/swiggy/login"
-          target="_blank"
-          rel="noreferrer"
-          className="mt-4 flex h-16 items-center justify-center rounded-2xl bg-brand text-2xl font-extrabold text-white"
-        >
-          🔑 Open Swiggy login
-        </a>
+        {dbMissing ? (
+          <p className="mt-4 rounded-2xl bg-red-50 p-3 text-base font-bold text-danger">Login is disabled until DATABASE_URL is set on Vercel — otherwise the OTP is wasted.</p>
+        ) : (
+          <a
+            href="/api/swiggy/login"
+            target="_blank"
+            rel="noreferrer"
+            className="mt-4 flex h-16 items-center justify-center rounded-2xl bg-brand text-2xl font-extrabold text-white"
+          >
+            🔑 Open Swiggy login
+          </a>
+        )}
         <div className="mt-3 flex flex-col gap-2">
           <input
             value={paste}
@@ -108,7 +112,7 @@ export function LoginClient() {
             placeholder="http://localhost/callback?code=…"
             className="rounded-xl border-2 border-line bg-white p-3 text-base"
           />
-          <button type="button" disabled={busy || paste.length < 6} onClick={() => void submitPaste()} className="h-14 rounded-2xl bg-go text-xl font-extrabold text-white disabled:opacity-40">
+          <button type="button" disabled={busy || paste.length < 6 || dbMissing} onClick={() => void submitPaste()} className="h-14 rounded-2xl bg-go text-xl font-extrabold text-white disabled:opacity-40">
             {busy ? "…" : "Save login"}
           </button>
         </div>

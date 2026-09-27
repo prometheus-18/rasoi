@@ -7,6 +7,7 @@ import { z } from "zod";
 import { json } from "@/lib/api";
 import { isOwnerRequest } from "@/lib/auth/owner";
 import { completeSwiggyPaste } from "@/lib/commerce/swiggy-auth";
+import { env } from "@/lib/env";
 import { sendOwner } from "@/lib/notify/telegram";
 import { resumeWaitingDrafts, retryApprovedDrafts } from "@/lib/orders/engine";
 import { runCheckout } from "@/lib/orders/checkout";
@@ -21,6 +22,7 @@ const ERRORS: Record<string, string> = {
 
 export async function POST(req: NextRequest) {
   if (!(await isOwnerRequest(req))) return json({ error: "owner_only" }, 401);
+  if (env.isDemo) return json({ error: "database_not_configured", message: "DATABASE_URL is not set on this deployment — the login cannot be saved. Add the Vercel environment variables and redeploy first." }, 503);
   const body = z.object({ pasted: z.string().min(6).max(4000) }).safeParse(await req.json().catch(() => null));
   if (!body.success) return json({ error: "bad_request" }, 400);
   try {
