@@ -18,7 +18,7 @@ import { HoldConfirm } from "@/components/HoldConfirm";
 import { LangToggle } from "@/components/LangToggle";
 import { PinPad } from "@/components/PinPad";
 
-type Variant = { spinId: string; skuId: string; packDesc: string; pricePaise: number; inStock: boolean };
+type Variant = { spinId: string; skuId: string; packDesc: string; pricePaise: number; inStock: boolean; maxQuantity?: number };
 type Candidate = { product: { name: string; brand?: string; imageUrl?: string }; variant: Variant };
 type Matched = {
   key: string;
@@ -234,7 +234,8 @@ export function ListClient({ draftId }: { draftId: string }) {
   function bump(item: Matched, delta: number) {
     const cur = lines[item.key];
     if (!cur) return;
-    const q = Math.max(0, Math.min(20, cur.quantity + delta));
+    const cap = item.chosen?.variant.maxQuantity ?? 20;
+    const q = Math.max(0, Math.min(cap, cur.quantity + delta));
     queueSync({ ...lines, [item.key]: { ...cur, quantity: q } });
   }
 

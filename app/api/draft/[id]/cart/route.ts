@@ -37,9 +37,14 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   const fresh = await store.getDraft(id);
   if (!fresh || !EDITABLE.includes(fresh.state)) return json({ error: "bad_state", state: fresh?.state }, 409);
 
+  // never send more than Swiggy allows for a variant (it would silently reduce the cart)
+  const caps = new Map<string, number>();
+  for (const m of fresh.matched ?? []) for (const c of [m.chosen, ...(m.candidates ?? [])]) if (c?.variant.maxQuantity) caps.set(c.variant.spinId, c.variant.maxQuantity);
+  const lines = body.data.lines.map((l) => ({ ...l, quantity: Math.min(l.quantity, caps.get(l.spinId) ?? l.quantity) }));
+
   const provider = await getProvider();
   try {
-    const cart = await provider.updateCart(body.data.lines);
+    const cart = await provider.updateCart(lines);
     const pay = cart.paymentOptions ?? (await provider.getPaymentOptions().catch(() => undefined));
     const paymentMethod: PaymentMethod = pay?.swiggyMoney?.available ? "SWIGGY_MONEY" : "COD";
     const view = { ...cart, paymentOptions: pay };
@@ -47,7 +52,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     // If the cook tapped a candidate, remember the choice on the matched rows.
     const matched = (fresh.matched ?? []).map((m: MatchedItem) => {
       if (m.chosen) return m;
-      const line = body.data.lines.find((l) => m.candidates?.some((c) => c.variant.spinId === l.spinId));
+      const line = lines.find((l) => m.candidates?.some((c) => c.variant.spinId === l.spinId));
       if (!line) return m;
       const pick = m.candidates!.find((c) => c.variant.spinId === line.spinId)!;
       return { ...m, status: "matched" as const, chosen: pick, quantity: line.quantity };

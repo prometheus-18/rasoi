@@ -34,6 +34,8 @@ export async function GET(req: NextRequest) {
         addresses = (await provider.getAddresses()).map((a) => ({ ...a, pinned: a.id === env.pinnedAddressId }));
         const { describeSwiggyTools } = await import("@/lib/commerce/swiggy");
         tools = await describeSwiggyTools().catch(() => null);
+        const shape = await store.getKV("swiggy_cart_shape");
+        if (tools && shape) tools = { ...(tools as object), cartShape: shape };
       }
     } catch (e) {
       addressError = String((e as Error).message).slice(0, 200);

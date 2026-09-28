@@ -12,6 +12,7 @@
 //  - a timeout/ambiguous result → state "unknown", which blocks all new checkouts until
 //    reconciled via get_orders or resolved by the owner
 
+import { addressMatchesFingerprint, type AddressFingerprint } from "@/lib/commerce/address";
 import { getProvider } from "@/lib/commerce/provider";
 import { CommerceError } from "@/lib/commerce/swiggy-errors";
 import { sha256Hex } from "@/lib/crypto";
@@ -162,20 +163,17 @@ export async function runCheckout(draftId: string): Promise<void> {
         await sendOwner(`❌ Order NOT placed: total rose to ₹${rupeesText(live.toPayPaise)} (approved ₹${rupeesText(approvedPaise)}). Cook must confirm again.`);
         return;
       }
-      if (live.selectedAddressId !== env.pinnedAddressId) {
+      // The delivery address is the addressId we pass to checkout; if the cart also reports one, it must agree.
+      if (live.selectedAddressId !== undefined && live.selectedAddressId !== env.pinnedAddressId) {
         await voidAttempt(a, "terminal", "err_address", `cart address ${live.selectedAddressId} != pinned`, "CONFIG");
         await sendOwner("🚨 Order NOT placed: the cart's delivery address is not the pinned home address.");
         return;
       }
-      if (env.pinnedAddressFingerprint) {
-        const fp = JSON.parse(env.pinnedAddressFingerprint) as { pincode?: string; lat?: number; lng?: number };
+      {
+        // the pinned address must still exist on the account and (if a fingerprint is set) be unchanged
         const addr = (await provider.getAddresses()).find((x) => x.id === env.pinnedAddressId);
-        const round2 = (n?: number) => (n === undefined ? undefined : Math.round(n * 100) / 100);
-        const fpOk =
-          addr &&
-          (!fp.pincode || fp.pincode === addr.pincode) &&
-          (fp.lat === undefined || round2(fp.lat) === round2(addr.lat)) &&
-          (fp.lng === undefined || round2(fp.lng) === round2(addr.lng));
+        const fp = env.pinnedAddressFingerprint ? (JSON.parse(env.pinnedAddressFingerprint) as AddressFingerprint) : {};
+        const fpOk = Boolean(addr) && addressMatchesFingerprint(addr!, fp);
         if (!fpOk) {
           await voidAttempt(a, "terminal", "err_address", "pinned address fingerprint mismatch", "CONFIG");
           await sendOwner("🚨 Order NOT placed: the pinned address no longer matches its fingerprint. Someone edited the address?");

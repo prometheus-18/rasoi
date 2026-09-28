@@ -24,6 +24,8 @@ export type ProductVariant = {
   pricePaise: number;
   mrpPaise?: number;
   inStock: boolean;
+  /** Swiggy per-order cap for this variant (search_products → maxQuantity). */
+  maxQuantity?: number;
 };
 
 export type Product = {

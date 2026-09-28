@@ -89,8 +89,12 @@ function bestVariant(product: Product, item: VoiceItem): ProductVariant | null {
   return best;
 }
 
-/** How many units of the chosen variant approximate the requested quantity. */
+/** How many units of the chosen variant approximate the requested quantity (capped by Swiggy's maxQuantity). */
 export function unitsFor(item: VoiceItem, variant: ProductVariant): number {
+  return Math.min(rawUnitsFor(item, variant), variant.maxQuantity ?? 10);
+}
+
+function rawUnitsFor(item: VoiceItem, variant: ProductVariant): number {
   const wantG = desiredGrams(item);
   if (wantG !== null) {
     const g = packGrams(variant.packDesc);

@@ -46,6 +46,13 @@ export const env = {
   get pinnedAddressFingerprint() {
     return process.env.PINNED_ADDRESS_FINGERPRINT || undefined;
   },
+  /** "lat,lng" of the pinned address (optional; only used for track_order, which requires coordinates). */
+  get pinnedAddressLatLng(): { lat: number; lng: number } | undefined {
+    const raw = process.env.PINNED_ADDRESS_LATLNG;
+    if (!raw) return undefined;
+    const [lat, lng] = raw.split(",").map(Number);
+    return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : undefined;
+  },
   get isProduction() {
     return process.env.VERCEL_ENV === "production";
   },

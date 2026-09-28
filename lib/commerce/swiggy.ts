@@ -16,6 +16,8 @@ import { env } from "@/lib/env";
 import { getStore } from "@/lib/store";
 import { paise, type CartLine, type CartView, type PaymentMethod, type PaymentOptions, type Product, type ProviderOrder, type RawCheckoutOutcome, type TrackInfo } from "@/lib/types";
 
+// Live server (2026-09-28) exposes 16 tools; we allow the 11 we need. NOT allowed: create_address,
+// delete_address, confirm_order, check_payment_status (UPI-only flows), report_error.
 const ALLOWED_TOOLS = new Set([
   "search_products",
   "your_go_to_items",
@@ -26,7 +28,6 @@ const ALLOWED_TOOLS = new Set([
   "get_payment_options",
   "checkout",
   "get_orders",
-  "get_order_details",
   "track_order",
   "get_delivery_status",
 ]);
@@ -143,17 +144,20 @@ function mapImage(p: any): string | undefined {
 }
 
 function mapProduct(p: any): Product {
+  const variations = (p?.variations ?? p?.variants ?? []) as any[];
   return {
     name: String(p?.displayName ?? p?.name ?? "?"),
     brand: p?.brand ? String(p.brand) : undefined,
-    imageUrl: mapImage(p),
-    variants: ((p?.variations ?? p?.variants ?? []) as any[]).map((v) => ({
+    // images live on the variation in the live payload
+    imageUrl: mapImage(p) ?? variations.map((v) => mapImage(v)).find(Boolean),
+    variants: variations.map((v) => ({
       spinId: String(v?.spinId ?? ""),
       skuId: String(v?.skuId ?? ""),
       packDesc: String(v?.quantityDescription ?? v?.packDesc ?? ""),
       pricePaise: paise(v?.price?.offerPrice ?? v?.price ?? 0),
       mrpPaise: v?.price?.mrp !== undefined ? paise(v.price.mrp) : undefined,
       inStock: Boolean(v?.isInStockAndAvailable ?? v?.inStock ?? true),
+      maxQuantity: Number.isFinite(Number(v?.maxQuantity)) && Number(v.maxQuantity) > 0 ? Number(v.maxQuantity) : undefined,
     })),
   };
 }
@@ -264,6 +268,20 @@ export class SwiggyProvider implements CommerceProvider {
       { selectedAddressId: this.pinnedAddressId(), items: lines.map((l) => ({ spinId: l.spinId, skuId: l.skuId, quantity: l.quantity })) },
       "cart",
     );
+    // one sanitized sample of the live cart shape per day, for the owner page (no address/phone fields)
+    const store = getStore();
+    if (!(await store.getKV("swiggy_cart_shape"))) {
+      const d = p.data ?? {};
+      const sample = {
+        keys: Object.keys(d),
+        billBreakdown: d.billBreakdown,
+        itemKeys: Object.keys((d.items ?? [])[0] ?? {}),
+        cartWarning: d.cartWarning ?? null,
+        hasSelectedAddress: Boolean(d.selectedAddressDetails ?? d.selectedAddressId),
+        at: new Date().toISOString(),
+      };
+      await store.setKV("swiggy_cart_shape", sample, 24 * 3600_000).catch(() => {});
+    }
     return mapCart(p.data);
   }
 
@@ -318,9 +336,21 @@ export class SwiggyProvider implements CommerceProvider {
   }
 
   async getOrders(count = 10): Promise<ProviderOrder[]> {
-    // TODO(phase0): confirm which orderType returns Instamart orders (default is "DASH").
-    const p = await call("get_orders", { count }, "read");
-    return ((p.data?.orders ?? []) as any[]).map((o) => ({
+    // Default orderType is "DASH"; the account has no Instamart history yet, so also try "INSTAMART" and merge.
+    const seen = new Map<string, any>();
+    for (const args of [{ count }, { count, orderType: "INSTAMART" }]) {
+      try {
+        const p = await call("get_orders", args, "read");
+        for (const o of (p.data?.orders ?? []) as any[]) {
+          const id = String(o?.orderId ?? o?.id ?? "");
+          if (id && !seen.has(id)) seen.set(id, o);
+        }
+      } catch (e) {
+        if (seen.size) break;
+        throw e;
+      }
+    }
+    return [...seen.values()].map((o) => ({
       orderId: String(o?.orderId ?? ""),
       createdAt: o?.createdAt ? String(o.createdAt) : undefined,
       status: o?.status ? String(o.status) : undefined,
@@ -330,19 +360,36 @@ export class SwiggyProvider implements CommerceProvider {
     }));
   }
 
+  /** No get_order_details tool exists on the live server — look the order up in history instead. */
   async getOrderDetails(orderId: string): Promise<unknown> {
-    const p = await call("get_order_details", { orderId }, "read");
-    return p.data;
+    const orders = await this.getOrders(20);
+    return orders.find((o) => o.orderId === orderId) ?? null;
   }
 
+  /**
+   * track_order requires lat/lng (which Swiggy addresses do not expose); get_delivery_status needs only
+   * orderId + addressId and returns an absolute deliveryBy epoch. Use it first, fall back to track_order
+   * when PINNED_ADDRESS_LATLNG is configured.
+   */
   async trackOrder(orderId: string): Promise<TrackInfo> {
-    const p = await call("track_order", { orderId }, "read");
-    const d = p.data;
-    return {
-      status: d?.status ? String(d.status) : undefined,
-      etaMinutes: d?.etaMinutes !== undefined ? Number(d.etaMinutes) : d?.eta !== undefined ? Number(d.eta) : undefined,
-      message: p.message,
-      raw: d,
-    };
+    try {
+      const p = await call("get_delivery_status", { orderId, addressId: this.pinnedAddressId() }, "read");
+      const d = p.data ?? {};
+      const by = Number(d.deliveryBy ?? d.deliveryByEpoch ?? d.eta);
+      const byMs = Number.isFinite(by) ? (by > 1e12 ? by : by * 1000) : NaN;
+      const etaMinutes = Number.isFinite(byMs) ? Math.max(0, Math.round((byMs - Date.now()) / 60_000)) : undefined;
+      return { status: d.status ? String(d.status) : etaMinutes === 0 ? "DELIVERED" : "ARRIVING", etaMinutes, message: p.message, raw: d };
+    } catch (e) {
+      const ll = env.pinnedAddressLatLng;
+      if (!ll) throw e;
+      const p = await call("track_order", { orderId, lat: ll.lat, lng: ll.lng }, "read");
+      const d = p.data;
+      return {
+        status: d?.status ? String(d.status) : undefined,
+        etaMinutes: d?.etaMinutes !== undefined ? Number(d.etaMinutes) : d?.eta !== undefined ? Number(d.eta) : undefined,
+        message: p.message,
+        raw: d,
+      };
+    }
   }
 }
