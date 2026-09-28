@@ -7,7 +7,7 @@ import { env } from "@/lib/env";
 import { createOwnerLink } from "@/lib/auth/owner";
 import { sendOwner } from "@/lib/notify/telegram";
 import { runCheckout } from "@/lib/orders/checkout";
-import { getLimits, reconcileUnknownOrders, retryApprovedDrafts, spendContext } from "@/lib/orders/engine";
+import { cleanupAbandonedCart, getLimits, reconcileUnknownOrders, retryApprovedDrafts, spendContext } from "@/lib/orders/engine";
 import { getStore } from "@/lib/store";
 
 export const maxDuration = 300;
@@ -23,6 +23,7 @@ export async function GET(req: NextRequest) {
 
   const expired = await store.expireStaleDrafts(new Date(Date.now() - 2 * 3600_000));
   await reconcileUnknownOrders();
+  await cleanupAbandonedCart();
   await retryApprovedDrafts(runCheckout);
 
   const login = await swiggyLoginStatus();

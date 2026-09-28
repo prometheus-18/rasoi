@@ -98,6 +98,7 @@ export interface Store {
    */
   acquireLock(draftId: string, ttlMs: number, holder: LockHolder): Promise<boolean>;
   lockHeldBy(draftId: string, holder: LockHolder): Promise<boolean>;
+  lockInfo(): Promise<{ draftId: string | null; holder: LockHolder | null; acquiredAt: Date | null }>;
   releaseLock(draftId: string): Promise<void>;
 
   /** true = first time seeing this update_id (process it); false = duplicate (skip). */
@@ -409,6 +410,12 @@ class DrizzleStore implements Store {
     return rows.length > 0;
   }
 
+  async lockInfo() {
+    const rows = await db().select().from(t.commerceLock).where(eq(t.commerceLock.id, 1)).limit(1);
+    const r = rows[0];
+    return { draftId: r?.draftId ?? null, holder: (r?.holder as LockHolder | null) ?? null, acquiredAt: r?.acquiredAt ?? null };
+  }
+
   async releaseLock(draftId: string): Promise<void> {
     await db()
       .update(t.commerceLock)
@@ -703,6 +710,10 @@ export class MemoryStore implements Store {
   }
   async lockHeldBy(draftId: string, holder: LockHolder): Promise<boolean> {
     return this.s.lock.draftId === draftId && this.s.lock.holder === holder;
+  }
+  async lockInfo() {
+    const l = this.s.lock;
+    return { draftId: l.draftId, holder: l.holder, acquiredAt: l.acquiredAt ? new Date(l.acquiredAt) : null };
   }
   async releaseLock(draftId: string): Promise<void> {
     if (this.s.lock.draftId === draftId) this.s.lock = { draftId: null, holder: null, acquiredAt: null };

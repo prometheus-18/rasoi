@@ -9,7 +9,7 @@ import { timingSafeEqualStr } from "@/lib/crypto";
 import { env } from "@/lib/env";
 import { sendOwner } from "@/lib/notify/telegram";
 import { runCheckout } from "@/lib/orders/checkout";
-import { reconcileUnknownOrders, retryApprovedDrafts } from "@/lib/orders/engine";
+import { cleanupAbandonedCart, reconcileUnknownOrders, retryApprovedDrafts } from "@/lib/orders/engine";
 import { getStore } from "@/lib/store";
 
 export const maxDuration = 300;
@@ -22,6 +22,7 @@ export async function GET(req: NextRequest) {
   const store = getStore();
   await reconcileUnknownOrders();
   const expired = await store.expireStaleDrafts(new Date(Date.now() - 2 * 3600_000));
+  const cartCleared = await cleanupAbandonedCart();
   const retried = await retryApprovedDrafts(runCheckout);
 
   const login = await swiggyLoginStatus();
@@ -37,5 +38,5 @@ export async function GET(req: NextRequest) {
       );
     }
   }
-  return NextResponse.json({ ok: true, loginOk: login.loggedIn, expiredDrafts: expired, retriedApproved: retried });
+  return NextResponse.json({ ok: true, loginOk: login.loggedIn, expiredDrafts: expired, retriedApproved: retried, cartCleared });
 }

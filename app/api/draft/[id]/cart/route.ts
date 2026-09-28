@@ -46,7 +46,9 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
   try {
     const cart = await provider.updateCart(lines);
     const pay = cart.paymentOptions ?? (await provider.getPaymentOptions().catch(() => undefined));
-    const paymentMethod: PaymentMethod = pay?.swiggyMoney?.available ? "SWIGGY_MONEY" : "COD";
+    // Cash on delivery by default (Swiggy MCP documents COD for Instamart); the wallet only when the owner opts in
+    const preferWallet = (await store.getKV<boolean>("prefer_wallet")) === true;
+    const paymentMethod: PaymentMethod = preferWallet && pay?.swiggyMoney?.available ? "SWIGGY_MONEY" : "COD";
     const view = { ...cart, paymentOptions: pay };
 
     // If the cook tapped a candidate, remember the choice on the matched rows.

@@ -3,7 +3,9 @@
 // On total failure the OWNER is told (forward-on-failure) before the cook is told "मालिक को बता दिया".
 
 import { NextResponse, type NextRequest } from "next/server";
+import { after } from "next/server";
 import { json, msg, requireDevice } from "@/lib/api";
+import { cleanupAbandonedCart } from "@/lib/orders/engine";
 import { sendOwner } from "@/lib/notify/telegram";
 import { istDayStart } from "@/lib/orders/policy";
 import { getStore } from "@/lib/store";
@@ -41,6 +43,7 @@ export async function POST(req: NextRequest) {
       meta: { model: parsed.model, path: parsed.path, degraded: parsed.degraded, parseMs: parsed.ms, totalMs: Date.now() - t0, mime, errors: parsed.errors },
     });
     await store.supersedeActiveDrafts(auth.device.id, draft.id);
+    after(() => cleanupAbandonedCart());
     await store.audit("voice_parsed", {
       draftId: draft.id,
       deviceId: auth.device.id,

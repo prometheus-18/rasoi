@@ -7,7 +7,7 @@ import { MSG } from "@/lib/i18n";
 import { makeCallbackData, sendOwner } from "@/lib/notify/telegram";
 import { DEFAULT_LIMITS, evaluatePolicy, istDayStart, istWeekStart, type Limits, type PolicyLine, type PolicyReason } from "@/lib/orders/policy";
 import { getStore } from "@/lib/store";
-import { rupeesText, type CartView, type Draft, type PaymentMethod } from "@/lib/types";
+import { rupeesText, type CartView, type Draft, type DraftState, type PaymentMethod } from "@/lib/types";
 
 export type Flags = { paused: boolean; dryRun: boolean };
 
@@ -297,6 +297,28 @@ export async function reconcileUnknownOrders(): Promise<void> {
       await sendOwner(`✅ Resolved: the ₹${rupeesText(u.totalPaise)} order DID go through (order ${match.orderId}). New orders are unblocked.`);
     }
   }
+}
+
+/**
+ * Cart hygiene sweeper: if the draft holding the cart lease is expired/superseded/terminal, the items it
+ * put in the owner's shared Swiggy cart are cleared and the lease released. Never touches an active draft.
+ */
+export async function cleanupAbandonedCart(): Promise<boolean> {
+  const store = getStore();
+  const lock = await store.lockInfo();
+  if (!lock.draftId || lock.holder === "checkout") return false;
+  const draft = await store.getDraft(lock.draftId);
+  const active: DraftState[] = ["matched", "cart_synced", "awaiting_confirm", "approved", "approved_waiting_login", "placing_swiggypay", "placing_cod"];
+  if (draft && active.includes(draft.state)) return false;
+  try {
+    const provider = await getProvider();
+    await provider.clearCart();
+  } catch (e) {
+    console.error("cleanupAbandonedCart: clearCart failed", String(e));
+  }
+  await store.releaseLock(lock.draftId);
+  await store.audit("abandoned_cart_cleared", { draftId: lock.draftId });
+  return true;
 }
 
 /** Owner /resolve: manually settle an unknown order. */

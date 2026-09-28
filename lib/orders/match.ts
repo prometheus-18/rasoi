@@ -57,14 +57,21 @@ function desiredPieces(item: VoiceItem): number | null {
 }
 
 function nameScore(product: Product, term: string): number {
-  const name = product.name.toLowerCase();
+  const full = product.name.toLowerCase();
+  const name = full.replace(/\s*\(.*?\)\s*/g, " ").replace(/\s+/g, " ").trim(); // "onion (pyaaz)" → "onion"
   const t = term.toLowerCase();
-  if (name === t) return 3;
-  if (name.startsWith(t) || t.startsWith(name)) return 2.5;
-  if (name.includes(t)) return 2;
-  const words = t.split(/\s+/).filter(Boolean);
-  const hit = words.filter((w) => name.includes(w)).length;
-  return words.length ? (hit / words.length) * 2 : 0;
+  const combo = /[,&+]|\bcombo\b|\bpack of\b/.test(full) ? 0.8 : 0; // multi-product packs rank below the plain item
+  let score: number;
+  if (name === t || full === t) score = 3;
+  else if (name.startsWith(t + " ") || t.startsWith(name + " ")) score = 2.5;
+  else if (name.startsWith(t) || t.startsWith(name)) score = 2.3;
+  else if (name.includes(t)) score = 2;
+  else {
+    const words = t.split(/\s+/).filter(Boolean);
+    const hit = words.filter((w) => name.includes(w)).length;
+    score = words.length ? (hit / words.length) * 2 : 0;
+  }
+  return score - combo;
 }
 
 /** Pick the pack whose size fits the requested amount best (weight or piece count). */
